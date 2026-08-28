@@ -1,0 +1,41 @@
+# Explicitly excluded project
+/decimen-optical-transfer/
+
+# Local tooling and IDE state
+/.claude/
+/.vite/
+/.vs/
+**/.vscode/
+**/.idea/
+*.user
+*.suo
+
+# Dependency and build outputs
+**/node_modules/
+**/bin/
+**/obj/
+**/dist/
+**/build/
+**/.dart_tool/
+**/.gradle/
+**/graphify-out/
+**/.tmp-*/
+*.tsbuildinfo
+
+# Local configuration and secrets
+**/.env
+**/.env.*
+!**/.env.example
+*.pfx
+*.p12
+*.key
+
+# Generated project artifacts and checkpoints
+/checkpoints/
+/graphify-out/
+/paper-build/
+
+# Logs and OS files
+*.log
+.DS_Store
+Thumbs.db

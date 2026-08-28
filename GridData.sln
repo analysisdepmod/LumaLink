@@ -1,0 +1,32 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GridData.Server", "GridData.Server\GridData.Server.csproj", "{5EB32694-7FA5-AFAE-F474-08F5AC1402B5}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "griddata.client", "griddata.client\griddata.client.csproj", "{56D4615C-F9C5-0758-9DE3-B3E33A03C1AA}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{5EB32694-7FA5-AFAE-F474-08F5AC1402B5}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5EB32694-7FA5-AFAE-F474-08F5AC1402B5}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5EB32694-7FA5-AFAE-F474-08F5AC1402B5}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5EB32694-7FA5-AFAE-F474-08F5AC1402B5}.Release|Any CPU.Build.0 = Release|Any CPU
+		{56D4615C-F9C5-0758-9DE3-B3E33A03C1AA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{56D4615C-F9C5-0758-9DE3-B3E33A03C1AA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{56D4615C-F9C5-0758-9DE3-B3E33A03C1AA}.Debug|Any CPU.Deploy.0 = Debug|Any CPU
+		{56D4615C-F9C5-0758-9DE3-B3E33A03C1AA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{56D4615C-F9C5-0758-9DE3-B3E33A03C1AA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{56D4615C-F9C5-0758-9DE3-B3E33A03C1AA}.Release|Any CPU.Deploy.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {DFA75A65-6C1B-4094-91A2-DEA169128BF7}
+	EndGlobalSection
+EndGlobal

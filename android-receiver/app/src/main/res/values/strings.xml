@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">GridData Receiver</string>
+    <string name="camera_permission_required">Camera permission is required.</string>
+    <string name="capture_status">Native capture %1$d fps · %2$d ms · %3$dx%4$d</string>
+</resources>
