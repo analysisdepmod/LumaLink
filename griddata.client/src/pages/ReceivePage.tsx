@@ -81,11 +81,11 @@ export default function ReceivePage() {
   // mistaken for an impossibly fast optical link.
   const speedEpochRef = useRef(0)
   const doneRef = useRef(false)
-  const statsRef = useRef({ looks: 0, combinedWins: 0, superLooks: 0, superWins: 0, ms: 0, avgMs: 0, maxMs: 0, processed: 0, wasm: false, spatialSimd: false, proc: 0, tracked: 0, phase: 'search' as 'search' | 'bootstrap' | 'payload', colorConfidence: 0, spatialBlur: 0, gpuCapture: false })
+  const statsRef = useRef({ looks: 0, combinedWins: 0, superLooks: 0, superWins: 0, ms: 0, avgMs: 0, maxMs: 0, processed: 0, wasm: false, spatialSimd: false, webGpu: false, gpuSampleMs: 0, laneFrames: [0, 0] as [number, number], proc: 0, tracked: 0, phase: 'search' as 'search' | 'bootstrap' | 'payload', colorConfidence: 0, spatialBlur: 0, gpuCapture: false })
   const runRef = useRef({ firstValidAt: 0, firstDataAt: 0, validFrames: 0 })
   const pendingDataRef = useRef<ParsedFrame[]>([])
   const diagRef = useRef({ manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-' })
-  const [diag, setDiag] = useState({ manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-', ms: 0, wasm: false, phase: 'search' as 'search' | 'bootstrap' | 'payload', colorConfidence: 0 })
+  const [diag, setDiag] = useState({ manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-', ms: 0, wasm: false, webGpu: false, laneFrames: [0, 0] as [number, number], phase: 'search' as 'search' | 'bootstrap' | 'payload', colorConfidence: 0 })
 
   const reset = useCallback(() => {
     decoderRef.current = null
@@ -97,7 +97,7 @@ export default function ReceivePage() {
     startRef.current = 0
     speedEpochRef.current = 0
     doneRef.current = false
-    statsRef.current = { looks: 0, combinedWins: 0, superLooks: 0, superWins: 0, ms: 0, avgMs: 0, maxMs: 0, processed: 0, wasm: false, spatialSimd: false, proc: 0, tracked: 0, phase: 'search', colorConfidence: 0, spatialBlur: 0, gpuCapture: false }
+    statsRef.current = { looks: 0, combinedWins: 0, superLooks: 0, superWins: 0, ms: 0, avgMs: 0, maxMs: 0, processed: 0, wasm: false, spatialSimd: false, webGpu: false, gpuSampleMs: 0, laneFrames: [0, 0], proc: 0, tracked: 0, phase: 'search', colorConfidence: 0, spatialBlur: 0, gpuCapture: false }
     runRef.current = { firstValidAt: 0, firstDataAt: 0, validFrames: 0 }
     diagRef.current = { manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-' }
     setSnap(EMPTY)
@@ -156,6 +156,9 @@ export default function ReceivePage() {
         decoder: {
           wasm: statsRef.current.wasm,
           spatialSimd: statsRef.current.spatialSimd,
+          webGpu: statsRef.current.webGpu,
+          gpuSampleMs: Number(statsRef.current.gpuSampleMs.toFixed(2)),
+          laneFrames: statsRef.current.laneFrames,
           lastDecodeMs: Number(statsRef.current.ms.toFixed(2)),
           averageDecodeMs: Number(statsRef.current.avgMs.toFixed(2)),
           maxDecodeMs: Number(statsRef.current.maxMs.toFixed(2)),
@@ -332,7 +335,7 @@ export default function ReceivePage() {
         scanRate,
         combinedWins: statsRef.current.combinedWins,
       })
-      setDiag({ ...diagRef.current, ms: Math.round(statsRef.current.ms), wasm: statsRef.current.wasm, phase: statsRef.current.phase, colorConfidence: statsRef.current.colorConfidence })
+      setDiag({ ...diagRef.current, ms: Math.round(statsRef.current.ms), wasm: statsRef.current.wasm, webGpu: statsRef.current.webGpu, laneFrames: statsRef.current.laneFrames, phase: statsRef.current.phase, colorConfidence: statsRef.current.colorConfidence })
     }, 400)
     return () => clearInterval(id)
   }, [active])
@@ -437,6 +440,8 @@ export default function ReceivePage() {
               ? `${ENC_LABEL[detected.enc]} · ${detected.gridW}×${detected.gridH}${tileCount === 2 ? ' · Turbo ×2' : ''}${camRes ? ` · ${camRes.w}×${camRes.h}` : ''}`
               : `يبحث عن المصفوفة…${camRes ? ` (${camRes.w}×${camRes.h})` : ''}`}</span>
             {diag.wasm && <Tag color="green" style={{ margin: 0, fontSize: 11 }}>WASM</Tag>}
+            {diag.webGpu && <Tag color="purple" style={{ margin: 0, fontSize: 11 }}>WebGPU</Tag>}
+            {tileCount === 2 && <Tag color="blue" style={{ margin: 0, fontSize: 11 }}>L1 {diag.laneFrames[0]} · L2 {diag.laneFrames[1]}</Tag>}
             {snap.unique > 0 && <Tag color="success" style={{ margin: 0, fontSize: 11 }}>نقل فعّال</Tag>}
             {detected && <Tag color={diag.phase === 'payload' ? 'cyan' : 'gold'} style={{ margin: 0, fontSize: 11 }}>
               {diag.phase === 'payload' ? 'CV Lock' : 'تتبّع مبدئي'}

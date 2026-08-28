@@ -10,7 +10,7 @@
 // full LDPC decodes per candidate.
 
 import { locateMatrix, locateMatrixHeld, locateMatrixTracked, sampleMapped, sampleMappedBinary, sampleBarcodeLum, type GridMap, type Corners, type TrackState, type Located } from './matrixVision'
-import { equalizeSpatialReadings, estimateSpatialBlur, setSpatialSimd, softDemodLLR, softDemodLLRZoned, capacityBytes, capacityBytesZoned, type Encoding, type EncodingSpec, type ZoneMap } from './visualCodec'
+import { equalizeSpatialReadings, estimateSpatialBlur, setSpatialSimd, softDemodLLR, softDemodLLRZoned, capacityBytes, capacityBytesZoned, type CellReadings, type Encoding, type EncodingSpec, type ZoneMap } from './visualCodec'
 import { SoftReceiver } from './softReceiver'
 import { SuperReceiver } from './superReceiver'
 import { parseFrameLdpcSoft, specFromManifest, zoneMapFromManifest, type ParsedFrame, type TransferManifest } from './transferCodec'
@@ -19,6 +19,7 @@ import { setBpDecoder } from './ldpc'
 import { loadLdpcWasm } from './ldpcWasm'
 import { loadSpatialSimd } from './spatialSimdWasm'
 import { BARCODE_VERSION, BARCODE_ROWS, decodeBarcodeRow } from './metaBarcode'
+import { WebGpuGridSampler } from './webGpuGridSampler'
 
 let wasmActive = false
 let spatialSimdActive = false
@@ -58,6 +59,10 @@ interface DecodeReply {
   wasm: boolean
   /** Dense spatial equalizer is backed by WASM SIMD on this worker. */
   spatialSimd?: boolean
+  /** Grid-cell sampling ran in a WebGPU compute pipeline. */
+  webGpu?: boolean
+  /** GPU dispatch + compact cell-buffer readback time. */
+  gpuSampleMs?: number
   dark: boolean
   tracked?: boolean
   /** Receiver state: full acquisition or fast homography-tracked payload. */
@@ -188,6 +193,13 @@ function noteTrack(located: Located | null, usedTracked: boolean, decoded: boole
 
 let offCanvas: OffscreenCanvas | null = null
 let offCtx: OffscreenCanvasRenderingContext2D | null = null
+const webGpuSamplerPromise = WebGpuGridSampler.create()
+let webGpuSampler: WebGpuGridSampler | null = null
+let gpuFrameReady = false
+let gpuValidated = false
+let gpuDisabled = false
+let gpuValidationKey = ''
+let gpuFlipY = false
 
 let t0 = 0
 let curDark = false
@@ -196,6 +208,8 @@ let curTracked = false
 let curPhase: 'search' | 'bootstrap' | 'payload' = 'search'
 let curColorConfidence: number | undefined
 let curSpatialBlur: number | undefined
+let curWebGpu = false
+let curGpuSampleMs: number | undefined
 
 // A single fountain frame is intentionally noise-like, therefore its neighbour
 // correlation is a useful instantaneous MTF/blur observation.  Smooth it across
@@ -216,6 +230,34 @@ function calibratedSpatialBlur(rd: Parameters<typeof estimateSpatialBlur>[0], sp
 }
 function resetSpatialCalibration(): void { mtfKey = ''; mtfBlur = 0; mtfSamples = 0 }
 
+function resetGpuValidation(): void {
+  gpuValidated = false
+  gpuDisabled = false
+  gpuValidationKey = ''
+  gpuFlipY = false
+}
+
+/**
+ * Pearson agreement on a bounded luminance sample.  This is enough to choose
+ * the external-texture Y convention because payload cells are deliberately
+ * noise-like, while avoiding a second LDPC decode during GPU start-up.
+ */
+function luminanceAgreement(a: CellReadings, b: CellReadings): number {
+  const n = Math.min(a.lum.length, b.lum.length)
+  if (n < 2) return -1
+  const step = Math.max(1, Math.floor(n / 2048))
+  let count = 0, sumA = 0, sumB = 0, sumAA = 0, sumBB = 0, sumAB = 0
+  for (let i = 0; i < n; i += step) {
+    const av = a.lum[i], bv = b.lum[i]
+    count++; sumA += av; sumB += bv
+    sumAA += av * av; sumBB += bv * bv; sumAB += av * bv
+  }
+  const cov = sumAB - sumA * sumB / count
+  const varA = sumAA - sumA * sumA / count
+  const varB = sumBB - sumB * sumB / count
+  return cov / Math.sqrt(Math.max(1e-9, varA * varB))
+}
+
 function superFor(spec: EncodingSpec): SuperReceiver | null {
   if (spec.enc !== 'bw' || spec.gridW * spec.gridH < 10000) return null
   const key = `${spec.gridW}x${spec.gridH}`
@@ -226,7 +268,7 @@ function superFor(spec: EncodingSpec): SuperReceiver | null {
   }
   return superRx
 }
-self.onmessage = (e: MessageEvent<DecodeRequest>) => {
+self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
   const { pixels, bitmap, w, h, auto, spec, manifest, reset, id } = e.data
   t0 = performance.now()
   curQuad = undefined
@@ -234,8 +276,10 @@ self.onmessage = (e: MessageEvent<DecodeRequest>) => {
   curPhase = 'search'
   curColorConfidence = undefined
   curSpatialBlur = undefined
+  curWebGpu = false
+  curGpuSampleMs = undefined
   try {
-    if (reset) { locked = null; lockedZm = null; lockedTransferId = null; rx = null; superRx = null; superKey = ''; superFusedLooks = 0; superWins = 0; resetSpatialCalibration(); fCursor = 0; pendingKey = ''; pendingCount = 0; sinceProgress = 0; barcodeSeen = false; trackState = null; trackVelocity = null; heldMapFrames = 0; trackingReady = false; trackingGood = 0; trackedFailures = 0 }
+    if (reset) { locked = null; lockedZm = null; lockedTransferId = null; rx = null; superRx = null; superKey = ''; superFusedLooks = 0; superWins = 0; resetSpatialCalibration(); resetGpuValidation(); fCursor = 0; pendingKey = ''; pendingCount = 0; sinceProgress = 0; barcodeSeen = false; trackState = null; trackVelocity = null; heldMapFrames = 0; trackingReady = false; trackingGood = 0; trackedFailures = 0 }
     // Once any worker has decoded the manifest, CameraReader forwards it to the
     // whole pool. Lock every worker directly from that authoritative spec: data
     // frames deliberately carry no barcode, so they remain untouched LDPC payload.
@@ -250,6 +294,7 @@ self.onmessage = (e: MessageEvent<DecodeRequest>) => {
         rx = null
         superRx = null; superKey = ''; superFusedLooks = 0
         resetSpatialCalibration()
+        resetGpuValidation()
       }
       barcodeSeen = true
       pendingKey = ''; pendingCount = 0; sinceProgress = 0
@@ -259,6 +304,18 @@ self.onmessage = (e: MessageEvent<DecodeRequest>) => {
 
     let px: Uint8ClampedArray
     if (bitmap) {
+      // Upload before closing the transferable ImageBitmap. WebGPU retains the
+      // camera frame as a texture; the CPU readback remains temporarily for the
+      // proven finder/registration path, while steady-state cell sampling moves
+      // to the parallel compute shader below.
+      // Do not spend a GPU upload while the barcode search still owns the frame;
+      // the shader pays off only after a concrete grid is known.
+      // In auto mode the bootstrap manifest must stay on the proven CPU sampler.
+      // WebGPU enters only after another worker has decoded and broadcast the
+      // authoritative manifest, then it must pass the shadow comparison below.
+      const gpuSpec = auto ? (lockedTransferId != null ? locked : null) : spec
+      if (gpuSpec && webGpuSampler === null) webGpuSampler = await webGpuSamplerPromise
+      gpuFrameReady = !!gpuSpec && !!webGpuSampler?.upload(bitmap, w, h)
       if (!offCanvas || offCanvas.width !== w || offCanvas.height !== h) {
         offCanvas = new OffscreenCanvas(w, h)
         offCtx = offCanvas.getContext('2d', { willReadFrequently: true })
@@ -267,6 +324,7 @@ self.onmessage = (e: MessageEvent<DecodeRequest>) => {
       px = offCtx!.getImageData(0, 0, w, h).data
       bitmap.close()
     } else {
+      gpuFrameReady = false
       px = new Uint8ClampedArray(pixels!)
     }
     { let s = 0, c = 0; const b = ((h >> 1) * w + (w >> 1)) * 4; for (let i = -32; i <= 32; i += 4) { const p = b + i * 4; s += px[p] * 0.299 + px[p + 1] * 0.587 + px[p + 2] * 0.114; c++ } curDark = s / c < 6 }
@@ -348,9 +406,47 @@ self.onmessage = (e: MessageEvent<DecodeRequest>) => {
         // deadlocks all three workers at look 1 and yields 0/K forever.
         rx = new SoftReceiver(cap, known.rate ?? 0.6, denseBw ? 12 : 24, false)
       }
-      const rawReadings = known.enc === 'bw'
+      const cpuSample = (): CellReadings => known.enc === 'bw'
         ? sampleMappedBinary(px, w, h, map, known.gridW, known.gridH)
         : sampleMapped(px, w, h, map, known.gridW, known.gridH)
+      const validationKey = `${known.enc}:${known.gridW}x${known.gridH}`
+      if (gpuValidationKey && gpuValidationKey !== validationKey) resetGpuValidation()
+      if (!gpuValidationKey) gpuValidationKey = validationKey
+      let rawReadings: CellReadings | null = null
+      if (!gpuDisabled && gpuFrameReady && webGpuSampler) {
+        let gpu = await webGpuSampler.sample(located.inner, known.gridW, known.gridH, known.enc === 'bw', gpuFlipY)
+        if (gpu) {
+          curGpuSampleMs = gpu.ms
+          if (!gpuValidated) {
+            // Calibrate only once and never run LDPC twice for one exposure. The
+            // old CRC probe doubled the dominant decoder cost on every Turbo lane
+            // for up to 12 frames, making the whole transfer feel heavier. Compare
+            // a bounded luminance sample against the CPU coordinates instead and
+            // choose the texture orientation with the stronger correlation.
+            const cpu = cpuSample()
+            const normalScore = luminanceAgreement(cpu, gpu.readings)
+            const flipped = await webGpuSampler.sample(located.inner, known.gridW, known.gridH, known.enc === 'bw', !gpuFlipY)
+            const flippedScore = flipped ? luminanceAgreement(cpu, flipped.readings) : -1
+            if (flipped && flippedScore > normalScore) {
+              gpuFlipY = !gpuFlipY
+              gpu = flipped
+              curGpuSampleMs = gpu.ms
+            }
+            if (Math.max(normalScore, flippedScore) >= 0.72) {
+              gpuValidated = true
+              rawReadings = gpu.readings
+              curWebGpu = true
+            } else {
+              rawReadings = cpu
+              gpuDisabled = true
+            }
+          } else {
+            rawReadings = gpu.readings
+            curWebGpu = true
+          }
+        }
+      }
+      if (!rawReadings) rawReadings = cpuSample()
       curSpatialBlur = calibratedSpatialBlur(rawReadings, known)
       const readings = equalizeSpatialReadings(rawReadings, known, { strength: curSpatialBlur })
       curColorConfidence = meanReliability(readings.rel)
@@ -516,8 +612,8 @@ self.onmessage = (e: MessageEvent<DecodeRequest>) => {
   }
 }
 
-function reply(r: Omit<DecodeReply, 'ms' | 'wasm' | 'spatialSimd' | 'dark' | 'quad' | 'tracked' | 'phase' | 'colorConfidence' | 'superLooks' | 'superWins' | 'spatialBlur'>) {
-  ;(self as unknown as Worker).postMessage({ ...r, ms: performance.now() - t0, wasm: wasmActive, spatialSimd: spatialSimdActive, dark: curDark, quad: curQuad, tracked: curTracked, phase: curPhase, colorConfidence: curColorConfidence, superLooks: superRx?.count ?? 0, superWins, spatialBlur: curSpatialBlur })
+function reply(r: Omit<DecodeReply, 'ms' | 'wasm' | 'spatialSimd' | 'webGpu' | 'gpuSampleMs' | 'dark' | 'quad' | 'tracked' | 'phase' | 'colorConfidence' | 'superLooks' | 'superWins' | 'spatialBlur'>) {
+  ;(self as unknown as Worker).postMessage({ ...r, ms: performance.now() - t0, wasm: wasmActive, spatialSimd: spatialSimdActive, webGpu: curWebGpu, gpuSampleMs: curGpuSampleMs, dark: curDark, quad: curQuad, tracked: curTracked, phase: curPhase, colorConfidence: curColorConfidence, superLooks: superRx?.count ?? 0, superWins, spatialBlur: curSpatialBlur })
 }
 
 function meanReliability(rel?: Float32Array): number | undefined {

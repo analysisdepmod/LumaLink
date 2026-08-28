@@ -12,7 +12,7 @@ interface Props {
     manifest?: TransferManifest | null  // pass once decoded so the worker can derive zone map
     onScan: (result: ParsedFrame | null) => void
     onResolution?: (w: number, h: number, fps?: number) => void
-    onStats?: (s: { looks: number; combinedWins: number; superLooks: number; superWins: number; ms: number; avgMs: number; maxMs: number; processed: number; wasm: boolean; spatialSimd: boolean; proc: number; tracked: number; phase: 'search' | 'bootstrap' | 'payload'; colorConfidence: number; spatialBlur: number; gpuCapture: boolean }) => void
+    onStats?: (s: { looks: number; combinedWins: number; superLooks: number; superWins: number; ms: number; avgMs: number; maxMs: number; processed: number; wasm: boolean; spatialSimd: boolean; webGpu: boolean; gpuSampleMs: number; laneFrames: [number, number]; proc: number; tracked: number; phase: 'search' | 'bootstrap' | 'payload'; colorConfidence: number; spatialBlur: number; gpuCapture: boolean }) => void
     onDetect?: (spec: EncodingSpec) => void  // fires once auto-detect locks on
     /** Fires when the fixed metadata strip identifies a single or Turbo ×2 layout. */
     onLayoutDetect?: (lanes: 1 | 2) => void
@@ -232,6 +232,8 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
         let slowSamples = 0
         let fastSamples = 0
         let gpuCapture = false
+        let webGpuEver = false
+        const laneFrames: [number, number] = [0, 0]
         let nextLane = 0
         const isAuto = !!auto
         const onWorkerMsg = (wi: number) => (e: MessageEvent<DecodeReply>) => {
@@ -240,6 +242,9 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
             totalDecodeMs += e.data.ms
             if (e.data.ms > maxDecodeMs) maxDecodeMs = e.data.ms
             if (e.data.tracked) trackedFrames++
+            if (e.data.webGpu) webGpuEver = true
+            const repliedLane = workerLane[wi]
+            if (repliedLane === 0 || repliedLane === 1) laneFrames[repliedLane]++
             decodeEwma = decodeEwma === 0 ? e.data.ms : decodeEwma * 0.82 + e.data.ms * 0.18
             const { result, found, lockedSpec } = e.data
             if (e.data.lanes) {
@@ -302,7 +307,7 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
             onStatsRef.current?.({
                 looks: e.data.looks, combinedWins: e.data.combinedWins, superLooks: e.data.superLooks ?? 0, superWins: e.data.superWins ?? 0, ms: e.data.ms,
                 avgMs: totalDecodeMs / processed, maxMs: maxDecodeMs, processed,
-                wasm: e.data.wasm, spatialSimd: e.data.spatialSimd ?? false, proc: procRef.current, tracked: trackedFrames,
+                wasm: e.data.wasm, spatialSimd: e.data.spatialSimd ?? false, webGpu: webGpuEver, gpuSampleMs: e.data.gpuSampleMs ?? 0, laneFrames: [...laneFrames], proc: procRef.current, tracked: trackedFrames,
                 phase: e.data.phase ?? 'search', colorConfidence: e.data.colorConfidence ?? 0, spatialBlur: e.data.spatialBlur ?? 0, gpuCapture,
             })
             setBlackFeed(e.data.dark)
@@ -488,14 +493,9 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                                 // displayed frame. The sender advertises its FPS, so
                                 // this keeps one useful decode opportunity per frame.
                                 const laneCount = layoutRef.current
-                                // Advance Turbo's lane only after a frame is really
-                                // dispatched.  Advancing on every 30-fps video callback
-                                // lets the capture clock repeatedly land on the same
-                                // parity, starving the other tile with duplicate frames.
-                                const lane = laneCount > 1 ? (nextLane % laneCount) : 0
                                 const hasManifest = !!manifestRef.current
                                 const binaryMode = manifestRef.current?.enc === 'bw'
-                                let available = -1
+                                const dispatches: { worker: number; lane: number }[] = []
                                 // Bootstrap frames are deliberately repeated so one
                                 // SoftReceiver can combine several camera looks and
                                 // close the manifest. Distributing those identical
@@ -504,27 +504,55 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                                 // "initial tracking" and never learned K. Keep worker
                                 // 0 sticky only until the authoritative manifest is
                                 // decoded; payload immediately fans back out below.
-                                if (!hasManifest && !busy[0]) available = 0
-                                // Prefer the worker already accumulating this lane.
-                                if (hasManifest && available < 0 && laneCount > 1) {
-                                    for (let wi = 0; wi < workers.length; wi++) {
-                                        if (!busy[wi] && workerLane[wi] === lane) { available = wi; break }
+                                if (!hasManifest) {
+                                    if (laneCount === 1) {
+                                        if (!busy[0]) dispatches.push({ worker: 0, lane: 0 })
+                                    } else {
+                                        // Turbo manifests are striped across the same
+                                        // disjoint even/odd carousel as payload frames.
+                                        // Reading only lane 0 therefore withholds half
+                                        // the manifest parts and can delay K for hundreds
+                                        // of captures. Keep one sticky worker per lane
+                                        // from bootstrap onward; ReceivePage assembles
+                                        // manifest parts reported by both workers.
+                                        const claimed = new Set<number>()
+                                        const pickBootstrapWorker = (lane: number): number => {
+                                            for (let wi = 0; wi < workers.length; wi++)
+                                                if (!busy[wi] && !claimed.has(wi) && workerLane[wi] === lane) return wi
+                                            for (let wi = 0; wi < workers.length; wi++)
+                                                if (!busy[wi] && !claimed.has(wi) && workerLane[wi] < 0) return wi
+                                            for (let wi = 0; wi < workers.length; wi++)
+                                                if (!busy[wi] && !claimed.has(wi)) return wi
+                                            return -1
+                                        }
+                                        for (let lane = 0; lane < laneCount; lane++) {
+                                            const worker = pickBootstrapWorker(lane)
+                                            if (worker >= 0) {
+                                                claimed.add(worker)
+                                                dispatches.push({ worker, lane })
+                                            }
+                                        }
                                     }
-                                    // First capture of a lane claims an unused worker.
-                                    if (available < 0) for (let wi = 0; wi < workers.length; wi++) {
-                                        if (!busy[wi] && workerLane[wi] < 0) { available = wi; break }
+                                }
+                                // A Turbo camera exposure contains BOTH optical tiles.
+                                // Dispatch the two crops from this same exposure whenever
+                                // two workers are free; the old scheduler alternated lanes
+                                // and discarded half of every captured screen image.
+                                if (hasManifest && laneCount > 1) {
+                                    const claimed = new Set<number>()
+                                    const pickWorker = (lane: number): number => {
+                                        for (let wi = 0; wi < workers.length; wi++)
+                                            if (!busy[wi] && !claimed.has(wi) && workerLane[wi] === lane) return wi
+                                        for (let wi = 0; wi < workers.length; wi++)
+                                            if (!busy[wi] && !claimed.has(wi) && workerLane[wi] < 0) return wi
+                                        for (let wi = 0; wi < workers.length; wi++)
+                                            if (!busy[wi] && !claimed.has(wi)) return wi
+                                        return -1
                                     }
-                                    // Do not strand the remaining pool worker.  The two
-                                    // lane-affine workers preserve temporal combining
-                                    // whenever they are available, but Fountain payload
-                                    // frames are independent equations: when a preferred
-                                    // worker is busy, an idle worker already assigned to
-                                    // the other lane can decode this frame safely.  The
-                                    // old strict affinity left worker #3 idle for the
-                                    // entire Turbo transfer and capped a clean 8fps link
-                                    // near two decoders' throughput.
-                                    if (available < 0) for (let wi = 0; wi < workers.length; wi++) {
-                                        if (!busy[wi]) { available = wi; break }
+                                    for (let offset = 0; offset < laneCount; offset++) {
+                                        const lane = (nextLane + offset) % laneCount
+                                        const worker = pickWorker(lane)
+                                        if (worker >= 0) { claimed.add(worker); dispatches.push({ worker, lane }) }
                                     }
                                 }
                                 // A dense BW decode commonly takes >100 ms. Restricting
@@ -537,8 +565,8 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                                 // BW as well as colour across the pool; keeping BW on
                                 // worker 0 after temporal holds were removed imposed a
                                 // needless ~one-decode-time throughput ceiling.
-                                if (hasManifest && available < 0 && laneCount === 1) for (let wi = 0; wi < workers.length; wi++) {
-                                    if (!busy[wi]) { available = wi; break }
+                                if (hasManifest && laneCount === 1) for (let wi = 0; wi < workers.length; wi++) {
+                                    if (!busy[wi]) { dispatches.push({ worker: wi, lane: 0 }); break }
                                 }
                                 const advertisedFps = manifestRef.current?.fps
                                 // When the worker is comfortably below the camera/display
@@ -565,11 +593,16 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                                 const temporalFactor = laneCount === 2 ? 1.04
                                     : decodeEwma > 0 && decodeEwma < 165 ? 1.20
                                         : decodeEwma > 0 && decodeEwma < 240 ? 1.12 : 1.05
+                                // With two simultaneous dispatches one camera callback
+                                // supplies both lanes, so callback rate follows the sender
+                                // tick. If only one worker is free, double the callback
+                                // cadence to preserve aggregate Turbo throughput.
+                                const jobs = Math.max(1, dispatches.length)
                                 const targetFps = advertisedFps
-                                    ? Math.min(binaryMode ? 26 : laneCount === 2 ? 22 : 14, Math.max(3, advertisedFps * laneCount * temporalFactor))
-                                    : (laneCount === 2 ? 18 : 24)
-                                if (available >= 0 && now >= nextUsefulCaptureAt) {
-                                    dispatch(available, lane, vw, vh)
+                                    ? Math.min(binaryMode ? 26 : laneCount === 2 ? 22 : 14, Math.max(3, advertisedFps * laneCount / jobs * temporalFactor))
+                                    : (laneCount === 2 ? (jobs >= 2 ? 9 : 18) : 24)
+                                if (dispatches.length > 0 && now >= nextUsefulCaptureAt) {
+                                    for (const job of dispatches) dispatch(job.worker, job.lane, vw, vh)
                                     if (laneCount > 1) nextLane = (nextLane + 1) % laneCount
                                     // Keep the capture clock phase-locked instead of
                                     // scheduling the next deadline from *this* camera

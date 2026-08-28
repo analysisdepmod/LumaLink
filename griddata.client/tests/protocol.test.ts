@@ -7,6 +7,24 @@ import { decodeManifestWire, encodeManifestFrames, encodeManifestWire, fountainE
 import { capacityBytes, encodeCellsRGB, equalizeSpatialReadings, softDemodLLR, type EncodingSpec } from '../src/services/visualCodec.ts'
 import { encodeHierarchicalCells, hierarchicalLayout, hierarchicalSeeds, softDemodHierarchical } from '../src/services/hierarchicalCodec.ts'
 import { estimateSubpixelShift, fuseLooks } from '../src/services/superReceiver.ts'
+import { homographyCoefficients } from '../src/services/webGpuGridSampler.ts'
+
+test('WebGPU sampler homography maps the unit square onto all four grid corners', () => {
+  const corners = {
+    tl: { x: 13, y: 21 }, tr: { x: 741, y: 47 },
+    br: { x: 698, y: 612 }, bl: { x: 31, y: 570 },
+  }
+  const h = homographyCoefficients(corners)
+  const map = (u: number, v: number) => {
+    const weight = h[3] * u + h[7] * v + 1
+    return { x: (h[0] * u + h[1] * v + h[2]) / weight, y: (h[4] * u + h[5] * v + h[6]) / weight }
+  }
+  const close = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-3, `${actual} != ${expected}`)
+  for (const [u, v, expected] of [[0, 0, corners.tl], [1, 0, corners.tr], [1, 1, corners.br], [0, 1, corners.bl]] as const) {
+    const actual = map(u, v)
+    close(actual.x, expected.x); close(actual.y, expected.y)
+  }
+})
 
 test('metadata barcode preserves the exact non-zoned grid', () => {
   const row = encodeBarcodeRow({ version: 1, enc: 'color8', rate: 0.65, zones: false, ringWidth: 0, gridW: 64, gridH: 64 }, 64)
