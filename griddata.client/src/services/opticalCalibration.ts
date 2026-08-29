@@ -30,8 +30,16 @@ export function assessOpticalLink(input: OpticalCalibrationInput): OpticalCalibr
   const theoreticalKBs = input.senderFps && input.senderFps > 0
     ? input.chunkBytes * input.senderFps * laneCount / 1024
     : 0
-  const utilization = theoreticalKBs > 0
-    ? Math.max(0, Math.min(1, input.goodputKBs / theoreticalKBs))
+  // The raw optical ceiling includes captures that the measured channel says
+  // cannot decode, plus bounded Fountain rank overhead. Judge
+  // utilization against the attainable useful ceiling, otherwise a genuinely
+  // fast 10.36KB/s run is mislabeled strained merely because 12fps ×2 is the
+  // impossible, zero-loss/no-repair limit.
+  const usefulFrameFraction = Math.max(0.05, Math.min(1, input.validFrameRate))
+  const fountainPayloadFraction = 0.9
+  const attainableKBs = theoreticalKBs * usefulFrameFraction * fountainPayloadFraction
+  const utilization = attainableKBs > 0
+    ? Math.max(0, Math.min(1, input.goodputKBs / attainableKBs))
     : 0
   const colorReady = (input.colorConfidence ?? 0) >= 0.84 && input.validFrameRate >= 0.88 && input.averageDecodeMs <= 190
 
@@ -39,7 +47,7 @@ export function assessOpticalLink(input: OpticalCalibrationInput): OpticalCalibr
   // accurate recommendation rather than the older, hard-coded single-lane text.
   if (laneCount > 1) {
     if (input.validFrameRate >= 0.85 && input.averageDecodeMs <= 240 && utilization >= 0.7) {
-      return { status: 'clean', utilization, label: 'وصلة نظيفة', recommendation: colorReady ? `الوصلة نظيفة: حافظ على Fast 9fps مع Color8 و LDPC ${rate}. لا تنتقل إلى Color16 على هذا المسار قبل اختبار مستقل.` : `حافظ على ${turboProfile} و LDPC ${rate}.` }
+      return { status: 'clean', utilization, label: 'وصلة نظيفة', recommendation: colorReady ? `الوصلة نظيفة: حافظ على ${turboProfile} و LDPC ${rate}. لا تنتقل إلى Color16 على هذا المسار قبل اختبار مستقل.` : `حافظ على ${turboProfile} و LDPC ${rate}.` }
     }
     if (input.validFrameRate >= 0.75 && input.averageDecodeMs <= 360 && utilization >= 0.5) {
       return { status: 'stable', utilization, label: 'وصلة مستقرة', recommendation: `الإعداد الحالي هو الاختيار العملي: ${turboProfile} و LDPC ${rate}.` }

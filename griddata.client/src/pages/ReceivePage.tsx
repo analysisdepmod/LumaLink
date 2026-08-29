@@ -140,6 +140,7 @@ export default function ReceivePage() {
         validFrameRate: Number(validFrameRate.toFixed(3)),
         camera: cameraRef.current,
         optical: manifest ? {
+          protocolVersion: manifest.v,
           encoding: manifest.enc,
           grid: `${manifest.gridW}x${manifest.gridH}`,
           ldpcRate: manifest.rate,
@@ -186,6 +187,7 @@ export default function ReceivePage() {
           superResWins: statsRef.current.superWins,
         },
         fountain: decoderRef.current ? {
+          repairProfile: manifest?.v && manifest.v >= 8 ? '4:1-wide-packed128' : 'legacy',
           receivedEquations: decoderRef.current.receivedEquations,
           tailSolverAttempts: decoderRef.current.tailSolverAttempts,
           tailSolverChunks: decoderRef.current.tailSolverChunks,
@@ -270,11 +272,11 @@ export default function ReceivePage() {
       if (!manifestRef.current || manifestRef.current.id !== m.id) {
         manifestRef.current = m
         setManifestEpoch(epoch => epoch + 1)
-        // v4 doubles the density of the medium-wide repair equations. Keep v3
-        // on its original mapping so an interrupted older transfer remains
+        // v8 makes every repair medium-wide for the packed dense-tail solver.
+        // Keep every older seed mapping intact so interrupted transfers remain
         // decodable after updating this receiver.
         decoderRef.current?.dispose()
-        const nextDecoder = new FountainDecoder(m.k, m.chunk, m.v >= 3, m.v >= 4 ? 2 : 4, () => {
+        const nextDecoder = new FountainDecoder(m.k, m.chunk, m.v >= 3, m.v >= 8 ? 1 : m.v >= 4 ? 2 : 4, () => {
           if (decoderRef.current === nextDecoder && nextDecoder.isComplete) void finish()
         })
         decoderRef.current = nextDecoder

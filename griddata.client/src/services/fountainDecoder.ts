@@ -17,11 +17,12 @@ const C = 0.03
 const DELTA = 0.5
 // A clean Turbo ×2 link can still miss 15–20% of the *displayed* systematic
 // frames: it sees only one camera exposure per symbol, not every display flip.
-// At K≈460 that leaves 70–90 unknown chunks, so a 56-chunk-only tail solver
-// starts too late and many subsequently received direct packets are redundant.
-// 96 stays deliberately bounded (small enough for a worker and its 902-byte
-// chunks) while covering the measured optical loss window.
-const DENSE_TAIL_LIMIT = 96
+// Field runs at K≈460 leave 70–90 unknown chunks when the equation graph first
+// has full rank. Starting at 96 waits until after that useful rank is already
+// available. 128 is still a small worker-local system (about 116 KiB of payload
+// at the measured 902-byte chunks), but lets elimination close the graph sooner.
+const DENSE_TAIL_LIMIT = 128
+const DENSE_TAIL_RETRY_MASK = 3
 const cdfCache = new Map<number, Float64Array>()
 
 function buildCdf(k: number): Float64Array {
@@ -175,16 +176,16 @@ export class FountainDecoder {
    * set of mutually-entangled repair equations at the end.  Waiting for a rare
    * degree-one equation is the familiar slow 95–99% optical-transfer tail.
    *
-   * When at most 96 chunks remain, solve the already received repair equations
+   * When at most 128 chunks remain, solve the already received repair equations
    * with bounded GF(2) elimination.  Equations have already had known chunks
    * removed by `propagate`, so this is still a small worker-local problem.  It
-   * runs only every eighth new equation in a dedicated worker, avoiding both a
+   * runs only every fourth new equation in a dedicated worker, avoiding both a
    * general large-matrix decoder on every reply and a camera/UI main-thread stall.
    */
   private tryDenseTailSolve(): void {
     if (this.isComplete) return
     const missing = this.k - this.decodedCount
-    if (missing > DENSE_TAIL_LIMIT || this.pending.size < missing || (++this.tailSolveTicks & 7) !== 0) return
+    if (missing > DENSE_TAIL_LIMIT || this.pending.size < missing || (++this.tailSolveTicks & DENSE_TAIL_RETRY_MASK) !== 0) return
     if (this.tailSolveInFlight) return
     this.denseTailAttempts++
     const rows: DenseTailRow[] = [...this.pending.values()].map(pending => ({

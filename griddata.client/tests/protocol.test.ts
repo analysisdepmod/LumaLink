@@ -11,6 +11,22 @@ import { estimateSubpixelShift, fuseLooks } from '../src/services/superReceiver.
 import { homographyCoefficients } from '../src/services/webGpuGridSampler.ts'
 import { ldpcEncodeParity, makeLdpcKM } from '../src/services/ldpc.ts'
 import { instantiateLdpcWasm } from '../src/services/ldpcWasmCore.ts'
+import { assessOpticalLink } from '../src/services/opticalCalibration.ts'
+
+test('calibration rates measured Turbo useful capacity instead of an impossible raw ceiling', () => {
+  const result = assessOpticalLink({
+    goodputKBs: 10.36,
+    validFrameRate: 0.881,
+    averageDecodeMs: 144.16,
+    chunkBytes: 902,
+    ldpcRate: 0.625,
+    senderFps: 12,
+    lanes: 2,
+    colorConfidence: 0.86,
+  })
+  assert.equal(result.status, 'stable')
+  assert.ok(result.utilization > 0.61 && result.utilization < 0.63)
+})
 
 test('shipped SIMD Float32 WASM LDPC decodes through the zero-copy mapped input', async () => {
   const wasm = await instantiateLdpcWasm(readFileSync(new URL('../src/services/ldpcbp.wasm', import.meta.url)))
@@ -277,7 +293,7 @@ test('v6 manifest takes optical settings from the barcode lock', () => {
   assert.deepEqual(decodeManifestWire(wire, { enc: 'color8', gridW: 64, gridH: 64, rate: 0.625 }), manifest)
 })
 
-test('v7 fountain cadence closes under deterministic Turbo paired loss', () => {
+test('v8 fountain cadence improves deterministic Turbo paired loss while v7 stays compatible', () => {
   const completionCaptures = (mediumWideEvery: number) => {
     const k = 461
     const decoder = new FountainDecoder(k, 1, true, mediumWideEvery)
@@ -296,10 +312,12 @@ test('v7 fountain cadence closes under deterministic Turbo paired loss', () => {
     return { complete: decoder.isComplete, captures }
   }
   const robust = completionCaptures(2)
-  const iidOnly = completionCaptures(1)
+  const packedTail = completionCaptures(1)
   assert.equal(robust.complete, true)
   assert.ok(robust.captures < 400, `paired-loss mapping should close promptly (${robust.captures})`)
-  assert.equal(iidOnly.complete, false, 'every-repair-wide mapping must remain rejected for Turbo')
+  assert.equal(packedTail.complete, true)
+  assert.ok(packedTail.captures < robust.captures,
+    `v8 wide repairs should close before v7 (${packedTail.captures} vs ${robust.captures})`)
 })
 
 test('v7 compact manifest round-trips with barcode optical settings', () => {
@@ -307,6 +325,16 @@ test('v7 compact manifest round-trips with barcode optical settings', () => {
     v: 7, id: 43, kind: 'file', name: 'sample.pdf', mime: 'application/pdf',
     total: 416638, comp: 415620, compressed: true, sha256: 'c'.repeat(64),
     k: 461, chunk: 902, enc: 'color8', gridW: 64, gridH: 64, rate: 0.625, fps: 9,
+  }
+  const wire = encodeManifestWire(manifest)
+  assert.deepEqual(decodeManifestWire(wire, { enc: 'color8', gridW: 64, gridH: 64, rate: 0.625 }), manifest)
+})
+
+test('v8 compact manifest selects the packed-tail repair protocol', () => {
+  const manifest: TransferManifest = {
+    v: 8, id: 44, kind: 'file', name: 'sample.pdf', mime: 'application/pdf',
+    total: 416638, comp: 415620, compressed: true, sha256: 'd'.repeat(64),
+    k: 461, chunk: 902, enc: 'color8', gridW: 64, gridH: 64, rate: 0.625, fps: 12,
   }
   const wire = encodeManifestWire(manifest)
   assert.deepEqual(decodeManifestWire(wire, { enc: 'color8', gridW: 64, gridH: 64, rate: 0.625 }), manifest)

@@ -68,6 +68,14 @@ export default defineConfig(function (_a) {
             },
         },
         server: {
+            // Match the production server's cross-origin isolation so the HTTPS
+            // development URL (normally :5555 on the LAN) can use
+            // SharedArrayBuffer/Atomics across decoder workers as well.
+            headers: {
+                'Cross-Origin-Opener-Policy': 'same-origin',
+                'Cross-Origin-Embedder-Policy': 'require-corp',
+                'Cross-Origin-Resource-Policy': 'same-origin',
+            },
             // لا تُراقب ملفات المثبّت الكبيرة في public/browser (تسبب EBUSY وتعطّل السيرفر)
             watch: {
                 ignored: ['**/public/browser/**'],

@@ -10,6 +10,7 @@
     "build": "npm run asbuild && npm run simdbuild && tsc -b && vite build",
     "test": "npx --yes tsx --test tests/protocol.test.ts tests/codecLab.test.ts",
     "lab": "npx --yes tsx scripts/codecLab.ts",
+    "bench:fountain": "npx --yes tsx scripts/fountainBench.ts",
     "bench:ldpc": "npx --yes tsx scripts/ldpcBench.ts",
     "preview": "vite preview"
   },

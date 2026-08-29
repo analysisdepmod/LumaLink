@@ -36,7 +36,7 @@ export const FRAME_TYPE_DATA = 1
 export const FRAME_TYPE_SOLO = 2 // whole transfer in one static frame
 
 export interface TransferManifest {
-  v: 1 | 2 | 3 | 4 | 5 | 6 | 7
+  v: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
   id: number            // random id — receiver detects a new transfer by this
   kind: 'file' | 'text'
   name: string          // filename ('' for text)
@@ -63,7 +63,7 @@ export function isValidManifest(value: unknown): value is TransferManifest {
   const finite = (n: unknown, min: number, max: number): n is number => typeof n === 'number' && Number.isInteger(n) && n >= min && n <= max
   const gridW = m.gridW
   const gridH = m.gridH
-  return (m.v === 1 || m.v === 2 || m.v === 3 || m.v === 4 || m.v === 5 || m.v === 6 || m.v === 7)
+  return (m.v === 1 || m.v === 2 || m.v === 3 || m.v === 4 || m.v === 5 || m.v === 6 || m.v === 7 || m.v === 8)
     && finite(m.id, 0, 0xFFFF_FFFF)
     && (m.kind === 'file' || m.kind === 'text')
     && typeof m.name === 'string' && m.name.length <= 512
@@ -465,7 +465,7 @@ export function decodeManifestWire(body: Uint8Array, optical?: EncodingSpec): Tr
       const view = new DataView(body.buffer, body.byteOffset, body.byteLength)
       let off = 3
       const v = body[off++]
-      if (v !== 6 && v !== 7) return null
+      if (v !== 6 && v !== 7 && v !== 8) return null
       const id = view.getUint32(off, true); off += 4
       const flags = body[off++]!
       const fps10 = view.getUint16(off, true); off += 2
@@ -644,7 +644,7 @@ export async function buildTransfer(
   const solo = buildSolo(meta, opts.spec, packed, sha256, zm)
   if (solo) {
     const manifest: TransferManifest = {
-      v: zm ? 5 : 7, id: randomTransferId(),
+      v: zm ? 5 : 8, id: randomTransferId(),
       kind: meta.kind, name: meta.name, mime: meta.mime,
       total: raw.length, comp: packed.bytes.length, compressed: packed.compressed, sha256,
       k: 1, chunk: packed.bytes.length,
@@ -658,7 +658,7 @@ export async function buildTransfer(
   const k = Math.max(1, Math.ceil(packed.bytes.length / chunkSize))
 
   const manifest: TransferManifest = {
-    v: zm ? 5 : 7,
+    v: zm ? 5 : 8,
     id: randomTransferId(),
     kind: meta.kind,
     name: meta.name,
@@ -715,12 +715,11 @@ export async function buildTransfer(
   const leadingManifestCount = manifestFrames.length * Math.max(10,
     Math.ceil(bootstrapOpticalFrames / manifestFrames.length))
   const manifestBurst = manifestFrames.length
-  // Keep medium-wide repairs at every second repair. Making every repair wide
-  // looked better under IID loss, but Turbo drops/skips adjacent lane frames in
-  // pairs. The real field run then needed 751 equations, and a deterministic
-  // paired-loss model could fail to close entirely. The 4+1 cadence remains;
-  // w2 is the robust mapping for both random and paired optical loss.
-  const mediumWideEvery = 2
+  // v8 makes every repair medium-wide. With the packed 128-chunk tail solver this
+  // closes close to full rank under clean, loaded, and paired-burst field models;
+  // v7's alternating mapping remains in the receiver for older transfers. Zoned
+  // v5 retains its original mapping until its optical metadata format is upgraded.
+  const mediumWideEvery = zm ? 2 : 1
   const fullGroups = Math.floor(dataFrameCount / manifestEvery)
   const remainder = dataFrameCount % manifestEvery
   const frameCount = leadingManifestCount + fullGroups * (manifestEvery + manifestBurst) + remainder
