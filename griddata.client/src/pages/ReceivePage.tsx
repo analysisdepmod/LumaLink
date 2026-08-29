@@ -157,6 +157,8 @@ export default function ReceivePage() {
         } : null,
         decoder: {
           wasm: statsRef.current.wasm,
+          wasmPipeline: statsRef.current.wasm ? 'f32-simd-direct' : 'js-fallback',
+          sharedMemoryReady: globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined',
           spatialSimd: statsRef.current.spatialSimd,
           webGpu: statsRef.current.webGpu,
           gpuSampleMs: Number(statsRef.current.gpuSampleMs.toFixed(2)),

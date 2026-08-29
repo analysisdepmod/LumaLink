@@ -21,12 +21,13 @@
 // squeezes every marginal frame out of the optical channel before it gets there.
 
 import { parseFrameLdpcSoft, type ParsedFrame } from './transferCodec'
+import type { SoftBits } from './ldpc'
 
 const MATCH_THRESHOLD = 0.80 // sign-agreement fraction to call two captures "same frame"
 const CLAMP = 200            // cap accumulated |LLR| so a long static hold can't overflow BP
 
 export class SoftReceiver {
-  private acc: Float64Array | null = null
+  private acc: Float32Array | null = null
   private n = 0
   /** `looks` value at the last full-BP attempt on the current accumulator, so a
    *  stubborn frame doesn't re-run 24-iteration BP on every single capture. */
@@ -54,7 +55,7 @@ export class SoftReceiver {
    * exact same identity decision as chase-combining, so it never fuses looks
    * across a screen transition.
    */
-  sameFrame(llr: Float64Array): boolean {
+  sameFrame(llr: SoftBits): boolean {
     return !!this.acc && this.n === llr.length && this.agrees(llr)
   }
 
@@ -62,9 +63,9 @@ export class SoftReceiver {
    * Feed one capture's per-bit LLRs (transmit order, from softDemodLLR).
    * Returns a decoded frame as soon as the live accumulator closes, else null.
    */
-  feed(llr: Float64Array): ParsedFrame | null {
+  feed(llr: SoftBits): ParsedFrame | null {
     if (!this.acc || this.n !== llr.length) {
-      this.acc = Float64Array.from(llr)
+      this.acc = Float32Array.from(llr)
       this.n = llr.length
       this.looks = 1
       this.lastBpLooks = -99
@@ -78,7 +79,7 @@ export class SoftReceiver {
       this.looks++
     } else {
       // On-screen frame changed → start fresh on this capture.
-      this.acc = Float64Array.from(llr)
+      this.acc = Float32Array.from(llr)
       this.looks = 1
       this.lastBpLooks = -99
     }
@@ -110,7 +111,7 @@ export class SoftReceiver {
   }
 
   /** Sign-agreement fraction between a new capture and the accumulator. */
-  private agrees(llr: Float64Array): boolean {
+  private agrees(llr: SoftBits): boolean {
     const a = this.acc!
     let agree = 0, total = 0
     // Only count bits both vectors are reasonably confident about — near-zero

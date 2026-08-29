@@ -28,6 +28,19 @@ builder.WebHost.ConfigureKestrel(options =>
 
 var app = builder.Build();
 
+// Opt the PWA into cross-origin isolation. This makes SharedArrayBuffer and
+// WebAssembly shared memory available on HTTPS for future cooperative kernels.
+// The current LDPC strategy deliberately parallelises whole optical frames
+// across the existing worker pool; nested threads inside every worker would
+// oversubscribe mobile CPUs and reduce Turbo throughput.
+app.Use(async (context, next) =>
+{
+    context.Response.Headers["Cross-Origin-Opener-Policy"] = "same-origin";
+    context.Response.Headers["Cross-Origin-Embedder-Policy"] = "require-corp";
+    context.Response.Headers["Cross-Origin-Resource-Policy"] = "same-origin";
+    await next();
+});
+
 // Diagnostics travel only over the same LAN connection already used to load the
 // PWA; transfer payloads never pass through this endpoint. Each completed optical
 // transfer writes a small JSON receipt to disk so performance can be analysed

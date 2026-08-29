@@ -228,6 +228,10 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
         const POOL = Math.max(1, Math.min(poolCap, memCap, cores - 1))
         const workers: Worker[] = []
         const busy: boolean[] = []
+        const sharedTimingTicks = globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined'
+            ? new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2))
+            : null
+        sharedTimingTicks?.fill(-1)
         // Turbo lanes are independent optical views. Keep a worker sticky to a
         // lane once it has one, otherwise its SoftReceiver would alternate two
         // unrelated codewords and could never temporal-combine repeated looks.
@@ -302,6 +306,7 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                 recentSeedQueue.length = 0
                 lastSuccessfulTimingTick[0] = lastSuccessfulTimingTick[1] = null
                 lastObservedTimingTick[0] = lastObservedTimingTick[1] = null
+                sharedTimingTicks?.fill(-1)
                 duplicatePressure = 0
             }
             if (e.data.senderFps && e.data.senderFps >= 1 && e.data.senderFps <= 120)
@@ -325,6 +330,8 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                 }
                 if (result && e.data.timingTick != null)
                     lastSuccessfulTimingTick[timingLane] = e.data.timingTick
+                if (result && e.data.timingTick != null && sharedTimingTicks)
+                    Atomics.store(sharedTimingTicks, timingLane, e.data.timingTick)
             }
             if (activeTransferId != null && e.data.phase === 'payload') sessionPayloadLocked = true
             const stablePhase = sessionPayloadLocked ? 'payload' : (e.data.phase ?? 'search')
@@ -565,13 +572,13 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                     const rid = reqId++
                     if (useBitmap) {
                         createImageBitmap(video, sx, sy, cropW, cropH, { resizeWidth: procW, resizeHeight: procH, resizeQuality })
-                            .then(bmp => { if (cancelled) { bmp.close(); return } workers[wi].postMessage({ bitmap: bmp, w: procW, h: procH, auto: isAuto, spec, manifest: manifestRef.current ?? undefined, lastTimingTick: lastSuccessfulTimingTick[lane] ?? undefined, expectedLane: lane, id: rid }, [bmp]) })
+                            .then(bmp => { if (cancelled) { bmp.close(); return } workers[wi].postMessage({ bitmap: bmp, w: procW, h: procH, auto: isAuto, spec, manifest: manifestRef.current ?? undefined, lastTimingTick: lastSuccessfulTimingTick[lane] ?? undefined, expectedLane: lane, timingState: sharedTimingTicks?.buffer as SharedArrayBuffer | undefined, id: rid }, [bmp]) })
                             .catch(() => { busy[wi] = false })
                     } else {
                         canvas.width = procW; canvas.height = procH
                         ctx.drawImage(video, sx, sy, cropW, cropH, 0, 0, procW, procH)
                         const img = ctx.getImageData(0, 0, procW, procH)
-                        workers[wi].postMessage({ pixels: img.data.buffer, w: procW, h: procH, auto: isAuto, spec, manifest: manifestRef.current ?? undefined, lastTimingTick: lastSuccessfulTimingTick[lane] ?? undefined, expectedLane: lane, id: rid }, [img.data.buffer])
+                        workers[wi].postMessage({ pixels: img.data.buffer, w: procW, h: procH, auto: isAuto, spec, manifest: manifestRef.current ?? undefined, lastTimingTick: lastSuccessfulTimingTick[lane] ?? undefined, expectedLane: lane, timingState: sharedTimingTicks?.buffer as SharedArrayBuffer | undefined, id: rid }, [img.data.buffer])
                     }
                 }
                 type VideoFrameCapable = HTMLVideoElement & {

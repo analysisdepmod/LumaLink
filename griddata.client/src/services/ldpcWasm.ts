@@ -1,104 +1,14 @@
-// Glue between the JS codec and the WASM belief-propagation decoder (ldpcbp.ts).
-//
-// The Tanner graph is flattened to CSR arrays once per code and uploaded into
-// WASM memory; each decode then only ships the LLRs across. Output is identical
-// to ldpcDecodeJs, so this is a drop-in speed upgrade installed via setBpDecoder.
+// Browser loader for the optimized LDPC WebAssembly binary.
 
-import type { LdpcCode } from './ldpc'
 import wasmUrl from './ldpcbp.wasm?url'
+import { instantiateLdpcWasm, type WasmDecoder } from './ldpcWasmCore'
 
-interface WasmExports {
-  memory: WebAssembly.Memory
-  init(n: number, m: number, e: number): void
-  decode(iters: number): void
-  pCheckStart(): number
-  pEdgeVar(): number
-  pVarStart(): number
-  pVarEdge(): number
-  pLlr(): number
-  pHard(): number
-}
+export type { WasmDecoder } from './ldpcWasmCore'
 
-interface Flat {
-  n: number; m: number; k: number; E: number
-  checkStart: Int32Array; edgeVar: Int32Array; varStart: Int32Array; varEdge: Int32Array
-}
-
-/** Flatten an LdpcCode into the CSR arrays the WASM decoder consumes. */
-function flatten(code: LdpcCode): Flat {
-  const { k, m, n } = code
-  const checkStart = new Int32Array(m + 1)
-  let E = 0
-  for (let i = 0; i < m; i++) { checkStart[i] = E; E += code.checkMsgs[i].length + (i > 0 ? 2 : 1) }
-  checkStart[m] = E
-  const edgeVar = new Int32Array(E)
-  const varDeg = new Int32Array(n)
-  let e = 0
-  for (let i = 0; i < m; i++) {
-    const row = code.checkMsgs[i]
-    for (let t = 0; t < row.length; t++) { edgeVar[e] = row[t]; varDeg[row[t]]++; e++ }
-    edgeVar[e] = k + i; varDeg[k + i]++; e++
-    if (i > 0) { edgeVar[e] = k + i - 1; varDeg[k + i - 1]++; e++ }
-  }
-  const varStart = new Int32Array(n + 1)
-  let acc = 0
-  for (let v = 0; v < n; v++) { varStart[v] = acc; acc += varDeg[v] }
-  varStart[n] = acc
-  const varEdge = new Int32Array(E)
-  const fill = new Int32Array(n)
-  for (let eid = 0; eid < E; eid++) { const v = edgeVar[eid]; varEdge[varStart[v] + fill[v]++] = eid }
-  return { n, m, k, E, checkStart, edgeVar, varStart, varEdge }
-}
-
-export interface WasmDecoder {
-  decode(code: LdpcCode, llr: Float64Array, iters: number): Uint8Array
-}
-
-/** Instantiate the WASM module. Returns null if unavailable (→ JS fallback). */
 export async function loadLdpcWasm(): Promise<WasmDecoder | null> {
   try {
-    const res = await fetch(wasmUrl)
-    const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {
-      env: {
-        abort() { throw new Error('wasm abort') },
-        // AS Math maps to these when not using native ops on some targets.
-        'Math.log': Math.log, 'Math.tanh': Math.tanh,
-      },
-    })
-    const ex = instance.exports as unknown as WasmExports
-
-    const flatCache = new Map<string, Flat>()
-    let loadedKey = ''
-    // Views over WASM memory for the uploaded buffers; re-taken after each init()
-    // (init reallocates and may grow — and detach — the backing ArrayBuffer).
-    let vLlr: Float64Array, vHard: Uint8Array
-
-    const ensureCode = (code: LdpcCode): Flat => {
-      const key = code.k + ':' + code.m
-      let flat = flatCache.get(key)
-      if (!flat) { flat = flatten(code); flatCache.set(key, flat) }
-      if (loadedKey !== key) {
-        ex.init(flat.n, flat.m, flat.E)
-        const buf = ex.memory.buffer
-        new Int32Array(buf, ex.pCheckStart(), flat.m + 1).set(flat.checkStart)
-        new Int32Array(buf, ex.pEdgeVar(), flat.E).set(flat.edgeVar)
-        new Int32Array(buf, ex.pVarStart(), flat.n + 1).set(flat.varStart)
-        new Int32Array(buf, ex.pVarEdge(), flat.E).set(flat.varEdge)
-        vLlr = new Float64Array(buf, ex.pLlr(), flat.n)
-        vHard = new Uint8Array(buf, ex.pHard(), flat.n)
-        loadedKey = key
-      }
-      return flat
-    }
-
-    return {
-      decode(code, llr, iters) {
-        const flat = ensureCode(code)
-        vLlr.set(llr.subarray(0, flat.n))
-        ex.decode(iters)
-        return vHard.slice(0, flat.k)
-      },
-    }
+    const response = await fetch(wasmUrl)
+    return await instantiateLdpcWasm(await response.arrayBuffer())
   } catch {
     return null
   }

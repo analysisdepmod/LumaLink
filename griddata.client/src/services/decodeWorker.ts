@@ -23,7 +23,15 @@ import { WebGpuGridSampler } from './webGpuGridSampler'
 
 let wasmActive = false
 let spatialSimdActive = false
-loadLdpcWasm().then(w => { if (w) { setBpDecoder((code, llr, iters) => w.decode(code, llr, iters)); wasmActive = true } }).catch(() => {})
+loadLdpcWasm().then(w => {
+  if (w) {
+    setBpDecoder(
+      (code, llr, iters) => w.decode(code, llr, iters),
+      (code, llr, iters, permutation, mask) => w.decodeMapped(code, llr, iters, permutation, mask),
+    )
+    wasmActive = true
+  }
+}).catch(() => {})
 // The spatial filter is independent from LDPC WASM.  A SIMD-capable browser
 // moves the dense 128×128 equalizer into WebAssembly; unsupported phones keep
 // the safe scalar filter without affecting protocol compatibility.
@@ -47,6 +55,8 @@ interface DecodeRequest {
   /** Last timing tick that this lane already decoded successfully. */
   lastTimingTick?: number
   expectedLane?: 0 | 1
+  /** Atomic successful-tick table shared by every decoder worker when isolated. */
+  timingState?: SharedArrayBuffer
   id: number
 }
 export type WebGpuStatus = 'waiting' | 'probing' | 'active' | 'unavailable' | 'rejected'
@@ -306,7 +316,7 @@ function superFor(spec: EncodingSpec): SuperReceiver | null {
   return superRx
 }
 self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
-  const { pixels, bitmap, w, h, auto, spec, manifest, reset, lastTimingTick, expectedLane, id } = e.data
+  const { pixels, bitmap, w, h, auto, spec, manifest, reset, lastTimingTick, expectedLane, timingState, id } = e.data
   t0 = performance.now()
   curQuad = undefined
   curTracked = false
@@ -445,7 +455,8 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
           curSenderFps = timing.fps
           curTimingTick = timing.tick
           curTimingLane = timing.lane
-          if (lastTimingTick != null && timing.tick === lastTimingTick) {
+          const sharedTick = timingState ? Atomics.load(new Int32Array(timingState), timing.lane) : -1
+          if (timing.tick === sharedTick || (sharedTick < 0 && lastTimingTick != null && timing.tick === lastTimingTick)) {
             curDuplicateFrame = true
             reply({ id, result: null, found: true, looks: rx?.looks ?? 0, combinedWins: rx?.combinedWins ?? 0 })
             return

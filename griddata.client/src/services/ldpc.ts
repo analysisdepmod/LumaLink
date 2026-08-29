@@ -95,11 +95,17 @@ export function ldpcEncodeParity(code: LdpcCode, msg: Uint8Array): Uint8Array {
 // decoder here once it finishes instantiating (ldpcWasm.ts); until then — and in
 // any non-worker context — this stays null and the optimized JS path below runs.
 // Both produce identical output; WASM is purely a speed upgrade for dense grids.
-export type BpBackend = (code: LdpcCode, llr: Float64Array, iters: number) => Uint8Array
+export type SoftBits = Float32Array | Float64Array
+export type BpBackend = (code: LdpcCode, llr: SoftBits, iters: number) => Uint8Array
+export type BpMappedBackend = (code: LdpcCode, llr: SoftBits, iters: number, bytePermutation: Uint32Array, whiteMask: Uint8Array) => Uint8Array
 let bpBackend: BpBackend | null = null
-export function setBpDecoder(fn: BpBackend | null): void { bpBackend = fn }
+let bpMappedBackend: BpMappedBackend | null = null
+export function setBpDecoder(fn: BpBackend | null, mapped: BpMappedBackend | null = null): void {
+  bpBackend = fn
+  bpMappedBackend = mapped
+}
 
-export function ldpcDecode(code: LdpcCode, llr: Float64Array, iters = 40): Uint8Array {
+export function ldpcDecode(code: LdpcCode, llr: SoftBits, iters = 40): Uint8Array {
   if (bpBackend) {
     // If the WASM backend ever throws (memory/instantiation edge case), fall back
     // to the JS decoder instead of letting the exception bubble up and freeze the
@@ -109,8 +115,27 @@ export function ldpcDecode(code: LdpcCode, llr: Float64Array, iters = 40): Uint8
   return ldpcDecodeJs(code, llr, iters)
 }
 
+/** Decode transmitted byte-interleaved LLRs. The WASM backend writes them into
+ * its own input arena in codeword order while applying whitening, eliminating
+ * the old Float64 deinterleave allocation followed by a second WASM copy. */
+export function ldpcDecodeMapped(code: LdpcCode, llr: SoftBits, bytePermutation: Uint32Array, whiteMask: Uint8Array, iters = 40): Uint8Array {
+  if (bpMappedBackend) {
+    try { return bpMappedBackend(code, llr, iters, bytePermutation, whiteMask) } catch { /* JS fallback below */ }
+  }
+  const mapped = new Float32Array(code.n)
+  for (let srcByte = 0; srcByte < bytePermutation.length; srcByte++) {
+    const src = srcByte * 8, dst = bytePermutation[srcByte] * 8
+    for (let bit = 0; bit < 8 && dst + bit < code.n; bit++) {
+      const index = dst + bit
+      const value = llr[src + bit]
+      mapped[index] = whiteMask[index] ? -value : value
+    }
+  }
+  return ldpcDecode(code, mapped, iters)
+}
+
 /** Reference JS belief-propagation decoder (WASM mirrors this exactly). */
-export function ldpcDecodeJs(code: LdpcCode, llr: Float64Array, iters = 40): Uint8Array {
+export function ldpcDecodeJs(code: LdpcCode, llr: SoftBits, iters = 40): Uint8Array {
   const { k, m, n } = code
   // Tanner graph edges. Each check i connects: its message bits + p_i + p_{i-1}.
   // Variable index space: 0..k-1 = message, k..k+m-1 = parity bit i → k+i.

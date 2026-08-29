@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
 import { decodeBarcodeRow, decodeTimingBarcodeRow, encodeBarcodeRow, encodeTimingBarcodeRow } from '../src/services/metaBarcode.ts'
 import { FountainDecoder } from '../src/services/fountainDecoder.ts'
 import { indicesForSeed } from '../src/services/fountainDecoder.ts'
@@ -8,6 +9,24 @@ import { capacityBytes, encodeCellsRGB, equalizeSpatialReadings, softDemodLLR, t
 import { encodeHierarchicalCells, hierarchicalLayout, hierarchicalSeeds, softDemodHierarchical } from '../src/services/hierarchicalCodec.ts'
 import { estimateSubpixelShift, fuseLooks } from '../src/services/superReceiver.ts'
 import { homographyCoefficients } from '../src/services/webGpuGridSampler.ts'
+import { ldpcEncodeParity, makeLdpcKM } from '../src/services/ldpc.ts'
+import { instantiateLdpcWasm } from '../src/services/ldpcWasmCore.ts'
+
+test('shipped SIMD Float32 WASM LDPC decodes through the zero-copy mapped input', async () => {
+  const wasm = await instantiateLdpcWasm(readFileSync(new URL('../src/services/ldpcbp.wasm', import.meta.url)))
+  const code = makeLdpcKM(256, 160)
+  const message = new Uint8Array(code.k)
+  for (let i = 0; i < message.length; i++) message[i] = ((i * 29 + 7) >>> 3) & 1
+  const parity = ldpcEncodeParity(code, message)
+  const llr = new Float32Array(code.n)
+  for (let i = 0; i < code.k; i++) llr[i] = message[i] ? -5 : 5
+  for (let i = 0; i < code.m; i++) llr[code.k + i] = parity[i] ? -5 : 5
+  for (const i of [3, 77, 205, 319]) llr[i] = -Math.sign(llr[i]) * 0.4
+  const bytes = code.n / 8
+  const identity = Uint32Array.from({ length: bytes }, (_, i) => i)
+  const decoded = wasm.decodeMapped(code, llr, 12, identity, new Uint8Array(code.n))
+  assert.deepEqual([...decoded], [...message])
+})
 
 test('WebGPU sampler homography maps the unit square onto all four grid corners', () => {
   const corners = {

@@ -25,7 +25,7 @@ import { compress, decompress, packPayload, sha256Hex, unpackPayload, type Packe
 import { indicesForSeed } from './fountainDecoder'
 import { capacityBytes, capacityBytesZoned, bytesToBits, bitsToBytes, specRate, DEFAULT_RATE, type Encoding, type EncodingSpec, type ZoneMap } from './visualCodec'
 import { deserializeZoneMap, serializeZoneMap } from './adaptiveZones'
-import { makeLdpcKM, ldpcEncodeParity, ldpcDecode, type LdpcCode } from './ldpc'
+import { makeLdpcKM, ldpcEncodeParity, ldpcDecodeMapped, type LdpcCode, type SoftBits } from './ldpc'
 
 const MANIFEST_SUBHEADER = 2 // [partIndex, partCount] prefix on manifest payloads
 
@@ -244,24 +244,13 @@ export function packFrameLdpc(type: number, seed: number, payload: Uint8Array, c
   return interleave(bitsToBytes(cw))                // n bits = capacity bytes
 }
 
-/** Undo the byte-interleave at the LLR level (each byte = 8 consecutive LLRs). */
-function deinterleaveLLR(llr: Float64Array, capacity: number): Float64Array {
-  const perm = framePermutation(capacity)
-  const out = new Float64Array(capacity * 8)
-  for (let i = 0; i < capacity; i++) {
-    const src = i * 8, dst = perm[i] * 8
-    for (let b = 0; b < 8; b++) out[dst + b] = llr[src + b]
-  }
-  return out
-}
-
 /**
  * Soft parse: `llr` holds per-frame-bit LLRs (LLR>0 favours bit 0) in transmitted
  * order (from softDemodLLR). De-interleaves, LDPC-decodes, validates CRC. Null if
  * unrecoverable.
  */
 export function parseFrameLdpcSoft(
-  llr: Float64Array,
+  llr: SoftBits,
   capacity: number,
   rate: number = DEFAULT_RATE,
   fastOnly = false,
@@ -269,10 +258,8 @@ export function parseFrameLdpcSoft(
 ): ParsedFrame | null {
   if (llr.length < capacity * 8) return null
   const code = ldpcCodeFor(capacity, rate)
-  const cwLlr = deinterleaveLLR(llr, capacity)      // [message | parity] order
-  // Undo codeword whitening: a masked bit was flipped, so its LLR sign flips.
+  const perm = framePermutation(capacity)
   const mask = frameWhiteMask(code.n)
-  for (let i = 0; i < code.n; i++) if (mask[i]) cwLlr[i] = -cwLlr[i]
   const M = ldpcMessageBytes(capacity, rate)
 
   const check = (msgBits: Uint8Array): ParsedFrame | null => {
@@ -292,7 +279,17 @@ export function parseFrameLdpcSoft(
   // restoring RS-like scan speed for easy modes (bw/color8). Only genuinely noisy
   // frames fall through to the full soft decoder below.
   const hard = new Uint8Array(code.k)
-  for (let i = 0; i < code.k; i++) hard[i] = cwLlr[i] < 0 ? 1 : 0
+  // Read only the systematic message bits directly from transmitted order. This
+  // keeps clean frames allocation-free and leaves the parity portion untouched.
+  for (let srcByte = 0; srcByte < capacity; srcByte++) {
+    const src = srcByte * 8, dst = perm[srcByte] * 8
+    if (dst >= code.k) continue
+    for (let bit = 0; bit < 8 && dst + bit < code.k; bit++) {
+      const index = dst + bit
+      const value = mask[index] ? -llr[src + bit] : llr[src + bit]
+      hard[index] = value < 0 ? 1 : 0
+    }
+  }
   const fast = check(hard)
   if (fast) return fast
 
@@ -310,7 +307,7 @@ export function parseFrameLdpcSoft(
   // gets ~6, which the temporal combiner covers by closing on a later look (usually
   // via the cheap fast path once enough looks stack up). Floor 6 keeps BP useful.
   const iters = Math.max(2, Math.min(maxBpIters, Math.round(1_200_000 / code.n)))
-  return check(ldpcDecode(code, cwLlr, iters))
+  return check(ldpcDecodeMapped(code, llr, perm, mask, iters))
 }
 
 /** Pack one frame: [type|seed|len|payload|crc] → LDPC codeword → interleave. */
@@ -410,8 +407,8 @@ export function encodeManifestWire(m: TransferManifest): Uint8Array {
   const name = textEncoder.encode(m.name)
   const mime = textEncoder.encode(m.mime)
   // v6 leaves optical geometry, colour, rate and zones to the fixed barcode.
-  // FPS remains here because CameraReader uses it to avoid decoding duplicate
-  // camera captures; it is not part of the barcode.
+  // FPS remains here for backwards compatibility and transfer receipts. Updated
+  // receivers acquire it earlier from the dynamic timing barcode.
   if (m.v >= 6) {
     const out = new Uint8Array(61 + name.length + mime.length)
     const view = new DataView(out.buffer)

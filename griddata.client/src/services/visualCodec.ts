@@ -486,14 +486,14 @@ export function equalizeSpatialReadings(rd: CellReadings, s: EncodingSpec, opts?
 // phones. Each Web Worker is its own module instance, so these are private to it and
 // never shared across the pool. Grown on demand; the fill loops overwrite the whole
 // [0,len) range every call, so no clearing is needed.
-let _scratchOut: Float64Array | null = null
+let _scratchOut: Float32Array | null = null
 let _scratchUm0: Float32Array | null = null, _scratchUm1: Float32Array | null = null, _scratchUm2: Float32Array | null = null
-function scratchOut(nBits: number): Float64Array {
-  if (!_scratchOut || _scratchOut.length < nBits) _scratchOut = new Float64Array(nBits)
+function scratchOut(nBits: number): Float32Array {
+  if (!_scratchOut || _scratchOut.length < nBits) _scratchOut = new Float32Array(nBits)
   return _scratchOut
 }
 
-export function softDemodLLR(rd: CellReadings, s: EncodingSpec, opts?: SoftDemodOptions): Float64Array {
+export function softDemodLLR(rd: CellReadings, s: EncodingSpec, opts?: SoftDemodOptions): Float32Array {
   const useMimo = opts?.mimo !== false
   const useRel = opts?.reliability !== false
   const n = gridCells(s)
@@ -777,7 +777,7 @@ export function encodeCellsRGBZoned(payload: Uint8Array, zm: ZoneMap): Uint8Arra
  */
 export function softDemodLLRZoned(
   rd: CellReadings, zm: ZoneMap, opts?: SoftDemodOptions
-): Float64Array {
+): Float32Array {
   if (!isMultiZone(zm)) return softDemodLLR(rd, { enc: zm.zones[0].enc, gridW: zm.gridW, gridH: zm.gridH }, opts)
   const useMimo = opts?.mimo !== false
   const useRel  = opts?.reliability !== false
@@ -788,7 +788,7 @@ export function softDemodLLRZoned(
   const relOf = (i: number) => (useRel && rel ? rel[i] : 1)
 
   const nBits = capacityBytesZoned(zm) * 8
-  const out = new Float64Array(nBits)
+  const out = new Float32Array(nBits)
 
   const densest = zm.zones[0].enc
   const cal = colorCalibration(densest)

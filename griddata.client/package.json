@@ -5,11 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "asbuild": "asc assembly/ldpcbp.ts --config asconfig.json --target release",
+    "asbuild": "asc assembly/ldpcbp.ts --config asconfig.json --target release --enable simd",
     "simdbuild": "asc assembly/spatialSimd.ts --outFile src/services/spatialSimd.wasm --runtime stub --optimizeLevel 3 --shrinkLevel 0 --noAssert --enable simd",
     "build": "npm run asbuild && npm run simdbuild && tsc -b && vite build",
     "test": "npx --yes tsx --test tests/protocol.test.ts tests/codecLab.test.ts",
     "lab": "npx --yes tsx scripts/codecLab.ts",
+    "bench:ldpc": "npx --yes tsx scripts/ldpcBench.ts",
     "preview": "vite preview"
   },
   "dependencies": {
