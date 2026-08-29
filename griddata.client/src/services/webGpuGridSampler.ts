@@ -8,6 +8,7 @@ type GpuObject = any
 
 const GPU_TEXTURE_COPY_DST = 0x02
 const GPU_TEXTURE_BINDING = 0x04
+const GPU_TEXTURE_RENDER_ATTACHMENT = 0x10
 const GPU_BUFFER_MAP_READ = 0x01
 const GPU_BUFFER_COPY_SRC = 0x04
 const GPU_BUFFER_COPY_DST = 0x08
@@ -89,6 +90,11 @@ export interface GpuSampleResult {
   ms: number
 }
 
+export interface WebGpuInitResult {
+  sampler: WebGpuGridSampler | null
+  reason: string
+}
+
 /** Heckbert unit-square → quad coefficients, shared with the WGSL sampler. */
 export function homographyCoefficients(q: Corners): Float32Array {
   const x0 = q.tl.x, x1 = q.tr.x, x2 = q.br.x, x3 = q.bl.x
@@ -123,25 +129,31 @@ export class WebGpuGridSampler {
   private uniform: GpuObject
   private dead = false
 
-  private constructor(device: GpuObject) {
+  private constructor(device: GpuObject, pipeline: GpuObject) {
     this.device = device
-    this.pipeline = device.createComputePipeline({
-      layout: 'auto',
-      compute: { module: device.createShaderModule({ code: SAMPLE_SHADER }), entryPoint: 'main' },
-    })
+    this.pipeline = pipeline
     this.uniform = device.createBuffer({ size: 64, usage: GPU_BUFFER_UNIFORM | GPU_BUFFER_COPY_DST })
     device.lost.then(() => { this.dead = true }).catch(() => { this.dead = true })
   }
 
-  static async create(): Promise<WebGpuGridSampler | null> {
+  static async create(): Promise<WebGpuInitResult> {
     try {
       const gpu = (globalThis.navigator as Navigator & { gpu?: GpuObject }).gpu
-      if (!gpu) return null
+      if (!gpu) return { sampler: null, reason: 'navigator.gpu unavailable' }
       const adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' })
-      if (!adapter) return null
-      return new WebGpuGridSampler(await adapter.requestDevice())
-    } catch {
-      return null
+      if (!adapter) return { sampler: null, reason: 'no WebGPU adapter' }
+      const device = await adapter.requestDevice()
+      const descriptor = {
+        layout: 'auto',
+        compute: { module: device.createShaderModule({ code: SAMPLE_SHADER }), entryPoint: 'main' },
+      }
+      const pipeline = typeof device.createComputePipelineAsync === 'function'
+        ? await device.createComputePipelineAsync(descriptor)
+        : device.createComputePipeline(descriptor)
+      return { sampler: new WebGpuGridSampler(device, pipeline), reason: 'ready' }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      return { sampler: null, reason: reason || 'WebGPU initialization failed' }
     }
   }
 
@@ -153,7 +165,11 @@ export class WebGpuGridSampler {
         this.texture = this.device.createTexture({
           size: { width, height },
           format: 'rgba8unorm',
-          usage: GPU_TEXTURE_COPY_DST | GPU_TEXTURE_BINDING,
+          // copyExternalImageToTexture is specified as an external-image copy,
+          // but Chromium's implementation uses a render path and requires
+          // RENDER_ATTACHMENT as well. Without it the validation layer can leave
+          // a readable all-zero texture: exactly the field score 0.000.
+          usage: GPU_TEXTURE_COPY_DST | GPU_TEXTURE_BINDING | GPU_TEXTURE_RENDER_ATTACHMENT,
         })
         this.textureW = width
         this.textureH = height

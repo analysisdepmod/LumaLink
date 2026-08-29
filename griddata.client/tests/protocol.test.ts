@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { decodeBarcodeRow, encodeBarcodeRow } from '../src/services/metaBarcode.ts'
+import { decodeBarcodeRow, decodeTimingBarcodeRow, encodeBarcodeRow, encodeTimingBarcodeRow } from '../src/services/metaBarcode.ts'
 import { FountainDecoder } from '../src/services/fountainDecoder.ts'
 import { indicesForSeed } from '../src/services/fountainDecoder.ts'
 import { decodeManifestWire, encodeManifestFrames, encodeManifestWire, fountainEncode, packFrameLdpc, parseFrameLdpcSoft, seedForDataIndex, type TransferManifest } from '../src/services/transferCodec.ts'
@@ -48,6 +48,24 @@ test('version 2 metadata barcode advertises Turbo x2 layout', () => {
   const decoded = decodeBarcodeRow(luminance, 64)
   assert.equal(decoded?.version, 2)
   assert.equal(decoded?.lanes, 2)
+})
+
+test('timing barcode carries fractional fps, rolling tick, and lane', () => {
+  const row = encodeTimingBarcodeRow({ fps: 12.5, tick: 1733, lane: 1 }, 64)
+  const luminance = new Float32Array(64)
+  for (let cell = 0; cell < 64; cell++) luminance[cell] = row[cell * 3]
+  assert.deepEqual(decodeTimingBarcodeRow(luminance, 64), { fps: 12.5, tick: 1733 & 0x3ff, lane: 1 })
+})
+
+test('two metadata rows outvote the mid-contrast timing row for legacy readers', () => {
+  const metadata = encodeBarcodeRow({ version: 2, enc: 'color8', rate: 0.625, zones: false, ringWidth: 0, gridW: 64, gridH: 64, lanes: 2 }, 64)
+  const timing = encodeTimingBarcodeRow({ fps: 12, tick: 777, lane: 0 }, 64)
+  const averaged = new Float32Array(64)
+  for (let cell = 0; cell < 64; cell++) averaged[cell] = (metadata[cell * 3] * 2 + timing[cell * 3]) / 3
+  const decoded = decodeBarcodeRow(averaged, 64)
+  assert.equal(decoded?.version, 2)
+  assert.equal(decoded?.lanes, 2)
+  assert.equal(decoded?.gridW, 64)
 })
 
 test('LDPC frame survives the codec fast path', () => {
@@ -237,6 +255,41 @@ test('v6 manifest takes optical settings from the barcode lock', () => {
   }
   const wire = encodeManifestWire(manifest)
   assert.equal(decodeManifestWire(wire), null)
+  assert.deepEqual(decodeManifestWire(wire, { enc: 'color8', gridW: 64, gridH: 64, rate: 0.625 }), manifest)
+})
+
+test('v7 fountain cadence closes under deterministic Turbo paired loss', () => {
+  const completionCaptures = (mediumWideEvery: number) => {
+    const k = 461
+    const decoder = new FountainDecoder(k, 1, true, mediumWideEvery)
+    let captures = 0
+    while (!decoder.isComplete && captures < 1200) {
+      // 9 sender ticks sampled by a measured ~7.37 pair-decodes/s receiver.
+      // Both adjacent lanes are skipped together; the patterned 10% decode loss
+      // reproduces the non-IID field shape that exposed the w1 regression.
+      const senderTick = Math.floor(captures * 9 / 7.37)
+      for (const dataIndex of [senderTick * 2, senderTick * 2 + 1]) {
+        if ((dataIndex * 17 + 13) % 100 >= 10)
+          decoder.addFrame(seedForDataIndex(dataIndex, k, 8), new Uint8Array(1))
+      }
+      captures++
+    }
+    return { complete: decoder.isComplete, captures }
+  }
+  const robust = completionCaptures(2)
+  const iidOnly = completionCaptures(1)
+  assert.equal(robust.complete, true)
+  assert.ok(robust.captures < 400, `paired-loss mapping should close promptly (${robust.captures})`)
+  assert.equal(iidOnly.complete, false, 'every-repair-wide mapping must remain rejected for Turbo')
+})
+
+test('v7 compact manifest round-trips with barcode optical settings', () => {
+  const manifest: TransferManifest = {
+    v: 7, id: 43, kind: 'file', name: 'sample.pdf', mime: 'application/pdf',
+    total: 416638, comp: 415620, compressed: true, sha256: 'c'.repeat(64),
+    k: 461, chunk: 902, enc: 'color8', gridW: 64, gridH: 64, rate: 0.625, fps: 9,
+  }
+  const wire = encodeManifestWire(manifest)
   assert.deepEqual(decodeManifestWire(wire, { enc: 'color8', gridW: 64, gridH: 64, rate: 0.625 }), manifest)
 })
 

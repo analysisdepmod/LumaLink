@@ -1,3 +1,5 @@
+import { solveDenseTail, type DenseTailRow, type DenseTailValue } from './fountainTailSolve'
+
 class Mulberry32 {
   private state: number
   constructor(seed: number) { this.state = seed >>> 0 }
@@ -116,8 +118,11 @@ export class FountainDecoder {
   private tailSolveTicks = 0
   private denseTailAttempts = 0
   private denseTailChunks = 0
+  private tailWorker: Worker | null = null
+  private tailSolveInFlight = false
+  private tailWorkerDisabled = false
 
-  constructor(k: number, chunkSize: number, tailRepair = true, private readonly mediumWideEvery = 4) {
+  constructor(k: number, chunkSize: number, tailRepair = true, private readonly mediumWideEvery = 4, private readonly onComplete?: () => void) {
     this.k = k
     this.chunkSize = chunkSize
     this.tailRepair = tailRepair
@@ -129,6 +134,12 @@ export class FountainDecoder {
   get receivedEquations(): number { return this.seenSeeds.size }
   get tailSolverAttempts(): number { return this.denseTailAttempts }
   get tailSolverChunks(): number { return this.denseTailChunks }
+
+  dispose(): void {
+    this.tailWorker?.terminate()
+    this.tailWorker = null
+    this.tailSolveInFlight = false
+  }
 
   addFrame(seed: number, data: Uint8Array): boolean {
     if (this.isComplete) return true
@@ -152,7 +163,10 @@ export class FountainDecoder {
       set.add(pid)
     }
     this.propagate(pid)
-    this.tryDenseTailSolve()
+    // If ordinary peeling won the race, stop an older background tail job so it
+    // cannot publish a second completion after ReceivePage has already finished.
+    if (this.isComplete) this.dispose()
+    else this.tryDenseTailSolve()
     return true
   }
 
@@ -164,58 +178,60 @@ export class FountainDecoder {
    * When at most 96 chunks remain, solve the already received repair equations
    * with bounded GF(2) elimination.  Equations have already had known chunks
    * removed by `propagate`, so this is still a small worker-local problem.  It
-   * runs only every eighth new equation, avoiding a general large-matrix decoder
-   * on every camera reply.
+   * runs only every eighth new equation in a dedicated worker, avoiding both a
+   * general large-matrix decoder on every reply and a camera/UI main-thread stall.
    */
   private tryDenseTailSolve(): void {
     if (this.isComplete) return
     const missing = this.k - this.decodedCount
     if (missing > DENSE_TAIL_LIMIT || this.pending.size < missing || (++this.tailSolveTicks & 7) !== 0) return
+    if (this.tailSolveInFlight) return
     this.denseTailAttempts++
+    const rows: DenseTailRow[] = [...this.pending.values()].map(pending => ({
+      vars: [...pending.remaining],
+      data: pending.data.slice(),
+    }))
 
-    type Row = { vars: Set<number>; data: Uint8Array }
-    const basis = new Map<number, Row>()
-    for (const pending of this.pending.values()) {
-      const vars = new Set(pending.remaining)
-      const data = pending.data.slice()
-      while (vars.size > 0) {
-        let pivot = this.k
-        for (const index of vars) if (index < pivot) pivot = index
-        const prior = basis.get(pivot)
-        if (!prior) { basis.set(pivot, { vars, data }); break }
-        // XOR the two sparse coefficient rows and their coded payloads.
-        for (const index of prior.vars) {
-          if (vars.has(index)) vars.delete(index)
-          else vars.add(index)
-        }
-        xorInto(data, prior.data)
+    // The browser path must not pause camera callbacks while eliminating up to
+    // 96 equations. Tests/SSR have no Worker, so retain the deterministic sync
+    // fallback there.
+    if (typeof Worker === 'undefined' || this.tailWorkerDisabled) {
+      this.applyDenseTail(solveDenseTail(rows, missing), missing)
+      return
+    }
+    this.tailSolveInFlight = true
+    try {
+      this.tailWorker ??= new Worker(new URL('./fountainTailWorker.ts', import.meta.url), { type: 'module' })
+      this.tailWorker.onmessage = (event: MessageEvent<{ values: DenseTailValue[] | null }>) => {
+        this.tailSolveInFlight = false
+        this.applyDenseTail(event.data.values, missing)
       }
-    }
-    if (basis.size < missing) return
-
-    // Basis rows have their smallest coefficient as pivot; solve backwards so
-    // every non-pivot coefficient already has a value.
-    const values = new Map<number, Uint8Array>()
-    for (const pivot of [...basis.keys()].sort((a, b) => b - a)) {
-      const row = basis.get(pivot)!
-      const value = row.data.slice()
-      let ready = true
-      for (const index of row.vars) {
-        if (index === pivot) continue
-        const known = values.get(index)
-        if (!known) { ready = false; break }
-        xorInto(value, known)
+      this.tailWorker.onerror = () => {
+        this.tailSolveInFlight = false
+        this.tailWorkerDisabled = true
+        this.dispose()
       }
-      if (ready) values.set(pivot, value)
+      this.tailWorker.postMessage({ rows, missing }, rows.map(row => row.data.buffer))
+    } catch {
+      this.tailSolveInFlight = false
+      this.tailWorkerDisabled = true
+      this.dispose()
+      this.applyDenseTail(solveDenseTail(rows, missing), missing)
     }
-    if (values.size !== missing) return
+  }
 
-    for (const [index, value] of values) {
-      if (!this.decoded[index]) { this.decoded[index] = value; this.decodedCount++ }
+  private applyDenseTail(values: DenseTailValue[] | null, attemptedMissing: number): void {
+    if (!values) return
+    let added = 0
+    for (const { index, data } of values) {
+      if (!this.decoded[index]) { this.decoded[index] = data; this.decodedCount++; added++ }
     }
-    // The transfer is complete; retaining old equations wastes memory and is no
-    // longer useful.  `reconstruct()` reads the solved source chunks directly.
-    if (this.isComplete) { this.denseTailChunks += missing; this.pending.clear(); this.bySource.clear() }
+    if (this.isComplete) {
+      this.denseTailChunks += Math.min(attemptedMissing, added)
+      this.pending.clear(); this.bySource.clear()
+      this.dispose()
+      this.onComplete?.()
+    }
   }
 
   private propagate(startPid: number): void {

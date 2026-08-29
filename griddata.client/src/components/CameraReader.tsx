@@ -2,8 +2,8 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import { Tag, Button } from 'antd'
 import { CameraOutlined, SwapOutlined, ReloadOutlined, BulbOutlined, AimOutlined } from '@ant-design/icons'
 import { type EncodingSpec } from '../services/visualCodec'
-import { type ParsedFrame, type TransferManifest } from '../services/transferCodec'
-import type { DecodeReply, NormQuad } from '../services/decodeWorker'
+import { FRAME_TYPE_DATA, type ParsedFrame, type TransferManifest } from '../services/transferCodec'
+import type { DecodeReply, NormQuad, WebGpuStatus } from '../services/decodeWorker'
 
 interface Props {
     spec?: EncodingSpec   // manual/locked spec; omit when auto === true
@@ -12,17 +12,19 @@ interface Props {
     manifest?: TransferManifest | null  // pass once decoded so the worker can derive zone map
     onScan: (result: ParsedFrame | null) => void
     onResolution?: (w: number, h: number, fps?: number) => void
-    onStats?: (s: { looks: number; combinedWins: number; superLooks: number; superWins: number; ms: number; avgMs: number; maxMs: number; processed: number; wasm: boolean; spatialSimd: boolean; webGpu: boolean; gpuSampleMs: number; laneFrames: [number, number]; proc: number; tracked: number; phase: 'search' | 'bootstrap' | 'payload'; colorConfidence: number; spatialBlur: number; gpuCapture: boolean }) => void
+    onStats?: (s: { looks: number; combinedWins: number; superLooks: number; superWins: number; ms: number; avgMs: number; maxMs: number; processed: number; wasm: boolean; spatialSimd: boolean; webGpu: boolean; gpuSampleMs: number; webGpuStatus: WebGpuStatus; webGpuReason: string; workerPool: number; turboPairs: number; captureTargetFps: number; timingFps: number; timingSkips: number; laneFrames: [number, number]; proc: number; tracked: number; phase: 'search' | 'bootstrap' | 'payload'; colorConfidence: number; spatialBlur: number; gpuCapture: boolean }) => void
     onDetect?: (spec: EncodingSpec) => void  // fires once auto-detect locks on
     /** Fires when the fixed metadata strip identifies a single or Turbo ×2 layout. */
     onLayoutDetect?: (lanes: 1 | 2) => void
     /** 1 = normal full-frame scan, 2 = two side-by-side Turbo lanes. */
     tileCount?: 1 | 2
+    /** Let the sender barcode choose 1/2 lanes; false preserves the user's choice. */
+    autoLayout?: boolean
 }
 
 type Status = 'starting' | 'permission' | 'scanning' | 'error'
 
-export default function CameraReader({ spec, auto, active, manifest, onScan, onResolution, onStats, onDetect, onLayoutDetect, tileCount = 1 }: Props) {
+export default function CameraReader({ spec, auto, active, manifest, onScan, onResolution, onStats, onDetect, onLayoutDetect, tileCount = 1, autoLayout = true }: Props) {
     const videoRef = useRef<HTMLVideoElement>(null)
     const canvasRef = useRef<HTMLCanvasElement>(null)
     // Live tracking overlay: the worker reports the detected matrix corners each
@@ -44,6 +46,12 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
     // switching from one lane to Turbo ×2 does not tear down the camera/worker pool.
     const layoutRef = useRef<1 | 2>(tileCount)
     layoutRef.current = tileCount
+    // Physical layout learned from the sender is distinct from how many lanes
+    // the user chose to consume. Forced-single on a Turbo sender should crop L1
+    // at full detail, not scan the whole two-tile screen at half cell resolution.
+    const sourceLayoutRef = useRef<1 | 2>(tileCount)
+    const autoLayoutRef = useRef(autoLayout)
+    autoLayoutRef.current = autoLayout
     const manifestRef = useRef(manifest)
     manifestRef.current = manifest
     // Processing resolution (px). Kept modest while SEARCHING (fast, and the barcode
@@ -208,7 +216,15 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
         // keep the receiver responsive while still covering a 6.5-fps sender.
         // High-end receivers can spend a fourth spare core on independent
         // frames.  Huawei-class devices retain the proven three-worker ceiling.
-        const poolCap = ramGb >= 8 && cores >= 8 ? 4 : 3
+        // Turbo can pipeline two complete L1+L2 pairs. Four workers are modest
+        // for the measured 64² Color8 workload (~960px crops) and let the second
+        // camera exposure decode while the first pair is still in LDPC. Keep the
+        // conservative three-worker ceiling on smaller/low-memory devices.
+        // The tuned 64² CPU path no longer creates a WebGPU device/readback in
+        // every worker. A genuinely high-end receiver can therefore sustain a
+        // third complete Turbo pair for the 12-tick clean-link profile. Keep the
+        // proven four-worker ceiling everywhere else; Turbo only uses full pairs.
+        const poolCap = ramGb >= 6 && cores >= 8 ? 6 : ramGb >= 4 && cores >= 6 ? 4 : 3
         const POOL = Math.max(1, Math.min(poolCap, memCap, cores - 1))
         const workers: Worker[] = []
         const busy: boolean[] = []
@@ -216,6 +232,8 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
         // lane once it has one, otherwise its SoftReceiver would alternate two
         // unrelated codewords and could never temporal-combine repeated looks.
         const workerLane: number[] = []
+        const turboPairs: [number, number][] = []
+        let nextTurboPair = 0
         // Once the manifest is known, the sender tells us how frequently the
         // displayed matrix actually changes. A 30-fps camera looking at a 6.5-fps
         // sender otherwise spends most CPU time decoding the same optical frame
@@ -225,6 +243,7 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
         let nextUsefulCaptureAt = 0
         let reqId = 0
         let processed = 0
+        let decodeSamples = 0
         let totalDecodeMs = 0
         let maxDecodeMs = 0
         let trackedFrames = 0
@@ -233,25 +252,103 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
         let fastSamples = 0
         let gpuCapture = false
         let webGpuEver = false
+        let webGpuStatus: WebGpuStatus = 'waiting'
+        let webGpuReason = 'waiting for manifest'
         const laneFrames: [number, number] = [0, 0]
-        let nextLane = 0
+        // Worker tracking state is private, so replies can legitimately arrive as
+        // payload/bootstrap/payload while the pool warms up. Surface one session-
+        // level lock that becomes stable after any worker proves payload tracking.
+        let phaseTransferId: number | null = null
+        let sessionPayloadLocked = false
+        const recentDataSeeds = new Set<number>()
+        const recentSeedQueue: number[] = []
+        const lastSuccessfulTimingTick: [number | null, number | null] = [null, null]
+        const lastObservedTimingTick: [number | null, number | null] = [null, null]
+        let detectedSenderFps = 0
+        let timingSkips = 0
+        let duplicatePressure = 0
+        let captureTargetFps = 0
         const isAuto = !!auto
         const onWorkerMsg = (wi: number) => (e: MessageEvent<DecodeReply>) => {
             busy[wi] = false
             processed++
-            totalDecodeMs += e.data.ms
-            if (e.data.ms > maxDecodeMs) maxDecodeMs = e.data.ms
+            if (!e.data.duplicateFrame) {
+                decodeSamples++
+                totalDecodeMs += e.data.ms
+                if (e.data.ms > maxDecodeMs) maxDecodeMs = e.data.ms
+            }
             if (e.data.tracked) trackedFrames++
             if (e.data.webGpu) webGpuEver = true
+            const incomingGpuStatus = e.data.webGpuStatus ?? 'waiting'
+            const gpuPriority: Record<WebGpuStatus, number> = { waiting: 0, unavailable: 1, rejected: 2, probing: 3, active: 4 }
+            if (gpuPriority[incomingGpuStatus] >= gpuPriority[webGpuStatus]) {
+                webGpuStatus = incomingGpuStatus
+                webGpuReason = e.data.webGpuReason ?? webGpuReason
+            }
+            if (webGpuEver) webGpuStatus = 'active'
             const repliedLane = workerLane[wi]
             if (repliedLane === 0 || repliedLane === 1) laneFrames[repliedLane]++
-            decodeEwma = decodeEwma === 0 ? e.data.ms : decodeEwma * 0.82 + e.data.ms * 0.18
+            // A barcode-only duplicate reply is intentionally tiny; including it
+            // in LDPC capacity estimation would make the scheduler believe the
+            // device can decode far more real frames than it actually can.
+            if (!e.data.duplicateFrame)
+                decodeEwma = decodeEwma === 0 ? e.data.ms : decodeEwma * 0.82 + e.data.ms * 0.18
             const { result, found, lockedSpec } = e.data
+            const activeTransferId = manifestRef.current?.id ?? null
+            if (activeTransferId !== phaseTransferId) {
+                phaseTransferId = activeTransferId
+                sessionPayloadLocked = false
+                recentDataSeeds.clear()
+                recentSeedQueue.length = 0
+                lastSuccessfulTimingTick[0] = lastSuccessfulTimingTick[1] = null
+                lastObservedTimingTick[0] = lastObservedTimingTick[1] = null
+                duplicatePressure = 0
+            }
+            if (e.data.senderFps && e.data.senderFps >= 1 && e.data.senderFps <= 120)
+                detectedSenderFps = e.data.senderFps
+            const timingLane = e.data.timingLane
+            if (timingLane === 0 || timingLane === 1) {
+                const repeatedTick = lastObservedTimingTick[timingLane] === e.data.timingTick
+                lastObservedTimingTick[timingLane] = e.data.timingTick ?? lastObservedTimingTick[timingLane]
+                // The dynamic strip provides a direct duplicate signal even when
+                // LDPC was skipped and therefore no fountain seed exists.
+                duplicatePressure = duplicatePressure * 0.94 + (e.data.duplicateFrame || repeatedTick ? 0.06 : 0)
+                if (e.data.duplicateFrame) {
+                    timingSkips++
+                    // Shift the next expensive capture away from the stale display
+                    // phase. This is a direct clock correction, while the slower
+                    // duplicate-pressure loop remains the long-term rate control.
+                    if (detectedSenderFps > 0) {
+                        const phaseDelay = 1000 / detectedSenderFps * 0.45
+                        nextUsefulCaptureAt = Math.max(nextUsefulCaptureAt, performance.now() + phaseDelay)
+                    }
+                }
+                if (result && e.data.timingTick != null)
+                    lastSuccessfulTimingTick[timingLane] = e.data.timingTick
+            }
+            if (activeTransferId != null && e.data.phase === 'payload') sessionPayloadLocked = true
+            const stablePhase = sessionPayloadLocked ? 'payload' : (e.data.phase ?? 'search')
+            if (result?.type === FRAME_TYPE_DATA) {
+                const duplicate = recentDataSeeds.has(result.seed)
+                duplicatePressure = duplicatePressure * 0.92 + (duplicate ? 0.08 : 0)
+                if (!duplicate) {
+                    recentDataSeeds.add(result.seed)
+                    recentSeedQueue.push(result.seed)
+                    if (recentSeedQueue.length > 256) recentDataSeeds.delete(recentSeedQueue.shift()!)
+                }
+            }
             if (e.data.lanes) {
-                const changed = layoutRef.current !== e.data.lanes
-                layoutRef.current = e.data.lanes
-                if (changed) workerLane.fill(-1)
-                onLayoutRef.current?.(e.data.lanes)
+                sourceLayoutRef.current = e.data.lanes
+                if (autoLayoutRef.current) {
+                    const changed = layoutRef.current !== e.data.lanes
+                    layoutRef.current = e.data.lanes
+                    if (changed) {
+                        workerLane.fill(-1)
+                        turboPairs.length = 0
+                        nextTurboPair = 0
+                    }
+                    onLayoutRef.current?.(e.data.lanes)
+                }
             }
             if (lockedSpec) {
                 onDetectRef.current?.(lockedSpec)
@@ -306,9 +403,9 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
             }
             onStatsRef.current?.({
                 looks: e.data.looks, combinedWins: e.data.combinedWins, superLooks: e.data.superLooks ?? 0, superWins: e.data.superWins ?? 0, ms: e.data.ms,
-                avgMs: totalDecodeMs / processed, maxMs: maxDecodeMs, processed,
-                wasm: e.data.wasm, spatialSimd: e.data.spatialSimd ?? false, webGpu: webGpuEver, gpuSampleMs: e.data.gpuSampleMs ?? 0, laneFrames: [...laneFrames], proc: procRef.current, tracked: trackedFrames,
-                phase: e.data.phase ?? 'search', colorConfidence: e.data.colorConfidence ?? 0, spatialBlur: e.data.spatialBlur ?? 0, gpuCapture,
+                avgMs: decodeSamples ? totalDecodeMs / decodeSamples : 0, maxMs: maxDecodeMs, processed,
+                wasm: e.data.wasm, spatialSimd: e.data.spatialSimd ?? false, webGpu: webGpuEver, gpuSampleMs: e.data.gpuSampleMs ?? 0, webGpuStatus, webGpuReason, workerPool: workers.length, turboPairs: turboPairs.length, captureTargetFps, timingFps: detectedSenderFps, timingSkips, laneFrames: [...laneFrames], proc: procRef.current, tracked: trackedFrames,
+                phase: stablePhase, colorConfidence: e.data.colorConfidence ?? 0, spatialBlur: e.data.spatialBlur ?? 0, gpuCapture,
             })
             setBlackFeed(e.data.dark)
             // Stash the latest detected quad for the tracking-bracket draw loop.
@@ -316,7 +413,10 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                 // without the crop transform, so retain the visual guide only for
                 // the normal single-matrix scanner.
                 if (layoutRef.current === 1 && e.data.quad) quadRef.current = { q: e.data.quad, at: performance.now() }
-            onScanRef.current(found ? result : null)
+            // A barcode-confirmed duplicate never entered LDPC, so it is neither
+            // a valid nor a failed optical decode attempt. Keep benchmark rates
+            // honest and expose it separately through timingSkips.
+            if (!e.data.duplicateFrame) onScanRef.current(found ? result : null)
         }
         for (let i = 0; i < POOL; i++) {
             const wk = new Worker(new URL('../services/decodeWorker.ts', import.meta.url), { type: 'module' })
@@ -436,6 +536,7 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                     // the black area above/below the screen. Each worker still sees
                     // a perfectly ordinary GridData tile and uses its own barcode.
                     const laneCount = layoutRef.current
+                    const sourceLaneCount = sourceLayoutRef.current
                     const activeManifest = manifestRef.current
                     const knownEnc = activeManifest?.enc
                     // Single-lane capture must NEVER change its crop when metadata
@@ -444,10 +545,11 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                     // merely moved the same bug to every dense profile.  Dense modes
                     // now obtain their pixels by increasing `proc`, above, while the
                     // optical coordinate system remains identical for the whole run.
-                    const cropW = laneCount === 2 ? Math.max(1, Math.round(vw * 0.56)) : vw
-                    const cropH = laneCount === 2 ? Math.min(vh, cropW) : vh
-                    const sx = laneCount === 2 ? (lane === 0 ? 0 : vw - cropW) : 0
-                    const sy = laneCount === 2 ? Math.max(0, Math.round((vh - cropH) / 2)) : 0
+                    const cropTurboTile = laneCount === 2 || sourceLaneCount === 2
+                    const cropW = cropTurboTile ? Math.max(1, Math.round(vw * 0.56)) : vw
+                    const cropH = cropTurboTile ? Math.min(vh, cropW) : vh
+                    const sx = cropTurboTile ? (lane === 0 ? 0 : vw - cropW) : 0
+                    const sy = cropTurboTile ? Math.max(0, Math.round((vh - cropH) / 2)) : 0
                     const ar = cropW / cropH
                     const proc = isAuto ? procRef.current : fixedProc
                     const procW = ar >= 1 ? proc : Math.round(proc * ar)
@@ -463,13 +565,13 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                     const rid = reqId++
                     if (useBitmap) {
                         createImageBitmap(video, sx, sy, cropW, cropH, { resizeWidth: procW, resizeHeight: procH, resizeQuality })
-                            .then(bmp => { if (cancelled) { bmp.close(); return } workers[wi].postMessage({ bitmap: bmp, w: procW, h: procH, auto: isAuto, spec, manifest: manifestRef.current ?? undefined, id: rid }, [bmp]) })
+                            .then(bmp => { if (cancelled) { bmp.close(); return } workers[wi].postMessage({ bitmap: bmp, w: procW, h: procH, auto: isAuto, spec, manifest: manifestRef.current ?? undefined, lastTimingTick: lastSuccessfulTimingTick[lane] ?? undefined, expectedLane: lane, id: rid }, [bmp]) })
                             .catch(() => { busy[wi] = false })
                     } else {
                         canvas.width = procW; canvas.height = procH
                         ctx.drawImage(video, sx, sy, cropW, cropH, 0, 0, procW, procH)
                         const img = ctx.getImageData(0, 0, procW, procH)
-                        workers[wi].postMessage({ pixels: img.data.buffer, w: procW, h: procH, auto: isAuto, spec, manifest: manifestRef.current ?? undefined, id: rid }, [img.data.buffer])
+                        workers[wi].postMessage({ pixels: img.data.buffer, w: procW, h: procH, auto: isAuto, spec, manifest: manifestRef.current ?? undefined, lastTimingTick: lastSuccessfulTimingTick[lane] ?? undefined, expectedLane: lane, id: rid }, [img.data.buffer])
                     }
                 }
                 type VideoFrameCapable = HTMLVideoElement & {
@@ -496,6 +598,40 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                                 const hasManifest = !!manifestRef.current
                                 const binaryMode = manifestRef.current?.enc === 'bw'
                                 const dispatches: { worker: number; lane: number }[] = []
+                                // A Turbo exposure is one atomic pair. Wait until
+                                // both lane-owned workers are idle, then crop L1 and
+                                // L2 from the exact same camera frame. Letting the
+                                // faster lane run alone made its counter race ahead
+                                // and reassigned workers across unrelated SoftReceiver
+                                // histories. Once assigned, ownership never crosses.
+                                if (laneCount === 2 && workers.length >= 2) {
+                                    // Bootstrap keeps a single stateful pair so its
+                                    // SoftReceivers can combine repeated manifest
+                                    // looks. Payload may use every complete pair:
+                                    // on a four-worker device pair B overlaps pair A
+                                    // without ever decoding the same camera exposure.
+                                    const desiredPairs = hasManifest ? Math.floor(workers.length / 2) : 1
+                                    while (turboPairs.length < desiredPairs) {
+                                        const free = workerLane
+                                            .map((lane, wi) => ({ lane, wi }))
+                                            .filter(item => item.lane < 0 && !busy[item.wi])
+                                            .map(item => item.wi)
+                                        if (free.length < 2) break
+                                        const pair: [number, number] = [free[0], free[1]]
+                                        workerLane[pair[0]] = 0
+                                        workerLane[pair[1]] = 1
+                                        turboPairs.push(pair)
+                                    }
+                                    for (let offset = 0; offset < turboPairs.length; offset++) {
+                                        const pairIndex = (nextTurboPair + offset) % turboPairs.length
+                                        const pair = turboPairs[pairIndex]
+                                        if (!busy[pair[0]] && !busy[pair[1]]) {
+                                            dispatches.push({ worker: pair[0], lane: 0 }, { worker: pair[1], lane: 1 })
+                                            nextTurboPair = (pairIndex + 1) % turboPairs.length
+                                            break
+                                        }
+                                    }
+                                }
                                 // Bootstrap frames are deliberately repeated so one
                                 // SoftReceiver can combine several camera looks and
                                 // close the manifest. Distributing those identical
@@ -507,54 +643,12 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                                 if (!hasManifest) {
                                     if (laneCount === 1) {
                                         if (!busy[0]) dispatches.push({ worker: 0, lane: 0 })
-                                    } else {
-                                        // Turbo manifests are striped across the same
-                                        // disjoint even/odd carousel as payload frames.
-                                        // Reading only lane 0 therefore withholds half
-                                        // the manifest parts and can delay K for hundreds
-                                        // of captures. Keep one sticky worker per lane
-                                        // from bootstrap onward; ReceivePage assembles
-                                        // manifest parts reported by both workers.
-                                        const claimed = new Set<number>()
-                                        const pickBootstrapWorker = (lane: number): number => {
-                                            for (let wi = 0; wi < workers.length; wi++)
-                                                if (!busy[wi] && !claimed.has(wi) && workerLane[wi] === lane) return wi
-                                            for (let wi = 0; wi < workers.length; wi++)
-                                                if (!busy[wi] && !claimed.has(wi) && workerLane[wi] < 0) return wi
-                                            for (let wi = 0; wi < workers.length; wi++)
-                                                if (!busy[wi] && !claimed.has(wi)) return wi
-                                            return -1
-                                        }
-                                        for (let lane = 0; lane < laneCount; lane++) {
-                                            const worker = pickBootstrapWorker(lane)
-                                            if (worker >= 0) {
-                                                claimed.add(worker)
-                                                dispatches.push({ worker, lane })
-                                            }
-                                        }
                                     }
                                 }
                                 // A Turbo camera exposure contains BOTH optical tiles.
                                 // Dispatch the two crops from this same exposure whenever
                                 // two workers are free; the old scheduler alternated lanes
                                 // and discarded half of every captured screen image.
-                                if (hasManifest && laneCount > 1) {
-                                    const claimed = new Set<number>()
-                                    const pickWorker = (lane: number): number => {
-                                        for (let wi = 0; wi < workers.length; wi++)
-                                            if (!busy[wi] && !claimed.has(wi) && workerLane[wi] === lane) return wi
-                                        for (let wi = 0; wi < workers.length; wi++)
-                                            if (!busy[wi] && !claimed.has(wi) && workerLane[wi] < 0) return wi
-                                        for (let wi = 0; wi < workers.length; wi++)
-                                            if (!busy[wi] && !claimed.has(wi)) return wi
-                                        return -1
-                                    }
-                                    for (let offset = 0; offset < laneCount; offset++) {
-                                        const lane = (nextLane + offset) % laneCount
-                                        const worker = pickWorker(lane)
-                                        if (worker >= 0) { claimed.add(worker); dispatches.push({ worker, lane }) }
-                                    }
-                                }
                                 // A dense BW decode commonly takes >100 ms. Restricting
                                 // it to worker 0 capped the entire 10-fps profile at
                                 // 3-5 scans/s and discarded most displayed symbols.
@@ -568,7 +662,10 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                                 if (hasManifest && laneCount === 1) for (let wi = 0; wi < workers.length; wi++) {
                                     if (!busy[wi]) { dispatches.push({ worker: wi, lane: 0 }); break }
                                 }
-                                const advertisedFps = manifestRef.current?.fps
+                                // Timing barcode is available before the manifest,
+                                // so acquisition and payload share the sender's real
+                                // clock instead of beginning from a guessed cadence.
+                                const advertisedFps = manifestRef.current?.fps ?? (detectedSenderFps || undefined)
                                 // When the worker is comfortably below the camera/display
                                 // budget, sample about 1.5 exposures per displayed frame.
                                 // That gives SoftReceiver two geometrically registered looks
@@ -590,20 +687,43 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                                 // field testing increased both duplicates and transfer
                                 // time.  A 4% phase margin is the measured optimum;
                                 // preserve the richer temporal policy for one matrix.
-                                const temporalFactor = laneCount === 2 ? 1.04
+                                // Two pipelined pairs can outrun the sender's real
+                                // browser paint cadence even when it advertises 9fps.
+                                // Repeated fountain seeds are an exact phase-error
+                                // signal. Back off smoothly (down to 78%) until new
+                                // seeds dominate again, reducing LDPC/thermal load
+                                // without guessing the sender display's true rate.
+                                const temporalFactor = laneCount === 2
+                                    ? Math.max(0.78, 1.02 - duplicatePressure * 0.90)
                                     : decodeEwma > 0 && decodeEwma < 165 ? 1.20
                                         : decodeEwma > 0 && decodeEwma < 240 ? 1.12 : 1.05
-                                // With two simultaneous dispatches one camera callback
-                                // supplies both lanes, so callback rate follows the sender
-                                // tick. If only one worker is free, double the callback
-                                // cadence to preserve aggregate Turbo throughput.
-                                const jobs = Math.max(1, dispatches.length)
-                                const targetFps = advertisedFps
+                                // Turbo is always dispatched as two simultaneous jobs,
+                                // so its callback clock follows the sender tick directly.
+                                // One Turbo exposure always represents two jobs,
+                                // including the callback ticks where both pairs are
+                                // busy. Using dispatches.length here made the idle
+                                // diagnostic briefly divide by one and report an
+                                // impossible captureTargetFps above senderFps.
+                                const jobs = laneCount === 2 ? 2 : 1
+                                const opticalTargetFps = advertisedFps
                                     ? Math.min(binaryMode ? 26 : laneCount === 2 ? 22 : 14, Math.max(3, advertisedFps * laneCount / jobs * temporalFactor))
                                     : (laneCount === 2 ? (jobs >= 2 ? 9 : 18) : 24)
+                                // Fast advertises a 12-tick ceiling, but the receiver
+                                // chooses how much of it to consume. Derive a safe
+                                // exposure rate from the measured decode EWMA and the
+                                // workers that form complete Turbo pairs. Four-worker
+                                // devices settle near 9fps; six-worker devices can
+                                // rise to the full 12fps without a feedback channel.
+                                const activeDecodeWorkers = laneCount === 2
+                                    ? Math.max(2, turboPairs.length * 2)
+                                    : workers.length
+                                const processingCapacityFps = hasManifest && decodeEwma > 0
+                                    ? activeDecodeWorkers * 1000 / decodeEwma / jobs * 0.90
+                                    : opticalTargetFps
+                                const targetFps = Math.max(3, Math.min(opticalTargetFps, processingCapacityFps))
+                                captureTargetFps = targetFps
                                 if (dispatches.length > 0 && now >= nextUsefulCaptureAt) {
                                     for (const job of dispatches) dispatch(job.worker, job.lane, vw, vh)
-                                    if (laneCount > 1) nextLane = (nextLane + 1) % laneCount
                                     // Keep the capture clock phase-locked instead of
                                     // scheduling the next deadline from *this* camera
                                     // callback. At 30fps a 12.6fps target otherwise

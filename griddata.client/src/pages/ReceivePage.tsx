@@ -51,6 +51,7 @@ const ENC_LABEL: Record<Encoding, string> = {
 export default function ReceivePage() {
   const [active, setActive] = useState(false)
   const [tileCount, setTileCount] = useState<1 | 2>(1)
+  const [layoutAuto, setLayoutAuto] = useState(true)
   const [soundEnabled, setSoundEnabled] = useState(false)
   const tileCountRef = useRef<1 | 2>(1)
   tileCountRef.current = tileCount
@@ -81,13 +82,14 @@ export default function ReceivePage() {
   // mistaken for an impossibly fast optical link.
   const speedEpochRef = useRef(0)
   const doneRef = useRef(false)
-  const statsRef = useRef({ looks: 0, combinedWins: 0, superLooks: 0, superWins: 0, ms: 0, avgMs: 0, maxMs: 0, processed: 0, wasm: false, spatialSimd: false, webGpu: false, gpuSampleMs: 0, laneFrames: [0, 0] as [number, number], proc: 0, tracked: 0, phase: 'search' as 'search' | 'bootstrap' | 'payload', colorConfidence: 0, spatialBlur: 0, gpuCapture: false })
+  const statsRef = useRef({ looks: 0, combinedWins: 0, superLooks: 0, superWins: 0, ms: 0, avgMs: 0, maxMs: 0, processed: 0, wasm: false, spatialSimd: false, webGpu: false, gpuSampleMs: 0, webGpuStatus: 'waiting' as 'waiting' | 'probing' | 'active' | 'unavailable' | 'rejected', webGpuReason: 'waiting for manifest', workerPool: 0, turboPairs: 0, captureTargetFps: 0, timingFps: 0, timingSkips: 0, laneFrames: [0, 0] as [number, number], proc: 0, tracked: 0, phase: 'search' as 'search' | 'bootstrap' | 'payload', colorConfidence: 0, spatialBlur: 0, gpuCapture: false })
   const runRef = useRef({ firstValidAt: 0, firstDataAt: 0, validFrames: 0 })
   const pendingDataRef = useRef<ParsedFrame[]>([])
   const diagRef = useRef({ manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-' })
-  const [diag, setDiag] = useState({ manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-', ms: 0, wasm: false, webGpu: false, laneFrames: [0, 0] as [number, number], phase: 'search' as 'search' | 'bootstrap' | 'payload', colorConfidence: 0 })
+  const [diag, setDiag] = useState({ manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-', ms: 0, wasm: false, webGpu: false, webGpuStatus: 'waiting' as 'waiting' | 'probing' | 'active' | 'unavailable' | 'rejected', webGpuReason: 'waiting for manifest', laneFrames: [0, 0] as [number, number], phase: 'search' as 'search' | 'bootstrap' | 'payload', colorConfidence: 0 })
 
   const reset = useCallback(() => {
+    decoderRef.current?.dispose()
     decoderRef.current = null
     manifestRef.current = null
     assemblerRef.current = new ManifestAssembler()
@@ -97,7 +99,7 @@ export default function ReceivePage() {
     startRef.current = 0
     speedEpochRef.current = 0
     doneRef.current = false
-    statsRef.current = { looks: 0, combinedWins: 0, superLooks: 0, superWins: 0, ms: 0, avgMs: 0, maxMs: 0, processed: 0, wasm: false, spatialSimd: false, webGpu: false, gpuSampleMs: 0, laneFrames: [0, 0], proc: 0, tracked: 0, phase: 'search', colorConfidence: 0, spatialBlur: 0, gpuCapture: false }
+    statsRef.current = { looks: 0, combinedWins: 0, superLooks: 0, superWins: 0, ms: 0, avgMs: 0, maxMs: 0, processed: 0, wasm: false, spatialSimd: false, webGpu: false, gpuSampleMs: 0, webGpuStatus: 'waiting', webGpuReason: 'waiting for manifest', workerPool: 0, turboPairs: 0, captureTargetFps: 0, timingFps: 0, timingSkips: 0, laneFrames: [0, 0], proc: 0, tracked: 0, phase: 'search', colorConfidence: 0, spatialBlur: 0, gpuCapture: false }
     runRef.current = { firstValidAt: 0, firstDataAt: 0, validFrames: 0 }
     diagRef.current = { manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-' }
     setSnap(EMPTY)
@@ -158,6 +160,13 @@ export default function ReceivePage() {
           spatialSimd: statsRef.current.spatialSimd,
           webGpu: statsRef.current.webGpu,
           gpuSampleMs: Number(statsRef.current.gpuSampleMs.toFixed(2)),
+          webGpuStatus: statsRef.current.webGpuStatus,
+          webGpuReason: statsRef.current.webGpuReason,
+          workerPool: statsRef.current.workerPool,
+          turboPairs: statsRef.current.turboPairs,
+          captureTargetFps: Number(statsRef.current.captureTargetFps.toFixed(2)),
+          timingFps: Number(statsRef.current.timingFps.toFixed(2)),
+          timingSkips: statsRef.current.timingSkips,
           laneFrames: statsRef.current.laneFrames,
           lastDecodeMs: Number(statsRef.current.ms.toFixed(2)),
           averageDecodeMs: Number(statsRef.current.avgMs.toFixed(2)),
@@ -262,7 +271,11 @@ export default function ReceivePage() {
         // v4 doubles the density of the medium-wide repair equations. Keep v3
         // on its original mapping so an interrupted older transfer remains
         // decodable after updating this receiver.
-        decoderRef.current = new FountainDecoder(m.k, m.chunk, m.v >= 3, m.v >= 4 ? 2 : 4)
+        decoderRef.current?.dispose()
+        const nextDecoder = new FountainDecoder(m.k, m.chunk, m.v >= 3, m.v >= 4 ? 2 : 4, () => {
+          if (decoderRef.current === nextDecoder && nextDecoder.isComplete) void finish()
+        })
+        decoderRef.current = nextDecoder
         const early = pendingDataRef.current
         pendingDataRef.current = []
         for (const frame of early) acceptData(frame)
@@ -335,7 +348,7 @@ export default function ReceivePage() {
         scanRate,
         combinedWins: statsRef.current.combinedWins,
       })
-      setDiag({ ...diagRef.current, ms: Math.round(statsRef.current.ms), wasm: statsRef.current.wasm, webGpu: statsRef.current.webGpu, laneFrames: statsRef.current.laneFrames, phase: statsRef.current.phase, colorConfidence: statsRef.current.colorConfidence })
+      setDiag({ ...diagRef.current, ms: Math.round(statsRef.current.ms), wasm: statsRef.current.wasm, webGpu: statsRef.current.webGpu, webGpuStatus: statsRef.current.webGpuStatus, webGpuReason: statsRef.current.webGpuReason, laneFrames: statsRef.current.laneFrames, phase: statsRef.current.phase, colorConfidence: statsRef.current.colorConfidence })
     }, 400)
     return () => clearInterval(id)
   }, [active])
@@ -419,12 +432,13 @@ export default function ReceivePage() {
           auto
           active={active}
           tileCount={tileCount}
+          autoLayout={layoutAuto}
           manifest={manifestRef.current}
           onScan={onScan}
           onResolution={(w, h, fps) => { const camera = { w, h, ...(fps ? { fps } : {}) }; cameraRef.current = camera; setCamRes(camera) }}
           onStats={(s) => { statsRef.current = s }}
           onDetect={(spec) => { detectedRef.current = spec; setDetected(spec); if (!lockTonePlayedRef.current) { lockTonePlayedRef.current = true; playChannelTone('lock', soundEnabledRef.current) } }}
-          onLayoutDetect={(lanes) => setTileCount(lanes)}
+          onLayoutDetect={(lanes) => { if (layoutAuto) setTileCount(lanes) }}
         />
 
         <div className={`opt-rx-lock ${detected ? 'locked' : ''}`} aria-hidden="true"><i /><i /><b /></div>
@@ -441,6 +455,8 @@ export default function ReceivePage() {
               : `يبحث عن المصفوفة…${camRes ? ` (${camRes.w}×${camRes.h})` : ''}`}</span>
             {diag.wasm && <Tag color="green" style={{ margin: 0, fontSize: 11 }}>WASM</Tag>}
             {diag.webGpu && <Tag color="purple" style={{ margin: 0, fontSize: 11 }}>WebGPU</Tag>}
+            {!diag.webGpu && diag.webGpuStatus === 'probing' && <Tag color="geekblue" title={diag.webGpuReason} style={{ margin: 0, fontSize: 11 }}>WebGPU فحص</Tag>}
+            {!diag.webGpu && (diag.webGpuStatus === 'unavailable' || diag.webGpuStatus === 'rejected') && <Tag color="orange" title={diag.webGpuReason} style={{ margin: 0, fontSize: 11 }}>CPU · WebGPU غير فعّال</Tag>}
             {tileCount === 2 && <Tag color="blue" style={{ margin: 0, fontSize: 11 }}>L1 {diag.laneFrames[0]} · L2 {diag.laneFrames[1]}</Tag>}
             {snap.unique > 0 && <Tag color="success" style={{ margin: 0, fontSize: 11 }}>نقل فعّال</Tag>}
             {detected && <Tag color={diag.phase === 'payload' ? 'cyan' : 'gold'} style={{ margin: 0, fontSize: 11 }}>
@@ -497,9 +513,13 @@ export default function ReceivePage() {
           <div className="opt-receive-mode">
             <Segmented
               block
-              value={tileCount}
-              onChange={value => setTileCount(value as 1 | 2)}
+              value={layoutAuto ? 'auto' : tileCount}
+              onChange={value => {
+                if (value === 'auto') setLayoutAuto(true)
+                else { setLayoutAuto(false); setTileCount(value as 1 | 2) }
+              }}
               options={[
+                { label: 'تلقائي', value: 'auto' },
                 { label: 'مصفوفة واحدة', value: 1 },
                 { label: 'Turbo ×2', value: 2 },
               ]}

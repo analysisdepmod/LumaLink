@@ -9,7 +9,7 @@
 // row 0 with a CRC-8 check — near-instantaneous vs the old approach that ran
 // full LDPC decodes per candidate.
 
-import { locateMatrix, locateMatrixHeld, locateMatrixTracked, sampleMapped, sampleMappedBinary, sampleBarcodeLum, type GridMap, type Corners, type TrackState, type Located } from './matrixVision'
+import { locateMatrix, locateMatrixHeld, locateMatrixTracked, sampleMapped, sampleMappedBinary, sampleBarcodeLum, sampleRowLum, type GridMap, type Corners, type TrackState, type Located } from './matrixVision'
 import { equalizeSpatialReadings, estimateSpatialBlur, setSpatialSimd, softDemodLLR, softDemodLLRZoned, capacityBytes, capacityBytesZoned, type CellReadings, type Encoding, type EncodingSpec, type ZoneMap } from './visualCodec'
 import { SoftReceiver } from './softReceiver'
 import { SuperReceiver } from './superReceiver'
@@ -18,7 +18,7 @@ import { buildZoneMap, isMultiZone } from './adaptiveZones'
 import { setBpDecoder } from './ldpc'
 import { loadLdpcWasm } from './ldpcWasm'
 import { loadSpatialSimd } from './spatialSimdWasm'
-import { BARCODE_VERSION, BARCODE_ROWS, decodeBarcodeRow } from './metaBarcode'
+import { BARCODE_VERSION, BARCODE_ROWS, METADATA_BARCODE_ROWS, TIMING_BARCODE_ROW, decodeBarcodeRow, decodeTimingBarcodeRow } from './metaBarcode'
 import { WebGpuGridSampler } from './webGpuGridSampler'
 
 let wasmActive = false
@@ -44,9 +44,14 @@ interface DecodeRequest {
   spec?: EncodingSpec
   manifest?: TransferManifest
   reset?: boolean
+  /** Last timing tick that this lane already decoded successfully. */
+  lastTimingTick?: number
+  expectedLane?: 0 | 1
   id: number
 }
-interface DecodeReply {
+export type WebGpuStatus = 'waiting' | 'probing' | 'active' | 'unavailable' | 'rejected'
+
+export interface DecodeReply {
   id: number
   result: ParsedFrame | null
   found: boolean
@@ -55,6 +60,12 @@ interface DecodeReply {
   lockedSpec?: EncodingSpec
   /** Number of fixed visual lanes advertised by the metadata strip. */
   lanes?: 1 | 2
+  /** Sender timing read before full-grid demodulation. */
+  senderFps?: number
+  timingTick?: number
+  timingLane?: 0 | 1
+  /** Full LDPC was intentionally skipped because this tick already succeeded. */
+  duplicateFrame?: boolean
   ms: number
   wasm: boolean
   /** Dense spatial equalizer is backed by WASM SIMD on this worker. */
@@ -63,6 +74,9 @@ interface DecodeReply {
   webGpu?: boolean
   /** GPU dispatch + compact cell-buffer readback time. */
   gpuSampleMs?: number
+  /** Why WebGPU is or is not active; surfaced in diagnostics instead of silence. */
+  webGpuStatus?: WebGpuStatus
+  webGpuReason?: string
   dark: boolean
   tracked?: boolean
   /** Receiver state: full acquisition or fast homography-tracked payload. */
@@ -186,20 +200,38 @@ function noteTrack(located: Located | null, usedTracked: boolean, decoded: boole
     if (!trackingReady && ++trackingGood >= 8) trackingReady = true
     return
   }
-  if (usedTracked && !decoded && ++trackedFailures >= 6) {
+  // One failed strict tracked read is enough to force a fresh full acquisition on
+  // the next exposure. This keeps the speed benefit on a stable camera but makes
+  // drift self-clearing instead of serving a stale homography for six frames.
+  if (usedTracked && !decoded && ++trackedFailures >= 1) {
     trackState = null; trackVelocity = null; trackingReady = false; trackingGood = 0; trackedFailures = 0
   }
 }
 
 let offCanvas: OffscreenCanvas | null = null
 let offCtx: OffscreenCanvasRenderingContext2D | null = null
-const webGpuSamplerPromise = WebGpuGridSampler.create()
+// Creating an adapter/device in every worker competes with the CPU decoder even
+// when the active matrix is too small to amortize GPU upload + mapped readback.
+// Keep WebGPU completely cold until a dense workload has actually been locked.
+let webGpuSamplerPromise: ReturnType<typeof WebGpuGridSampler.create> | null = null
 let webGpuSampler: WebGpuGridSampler | null = null
+let gpuInitAttempted = false
+let gpuStatus: WebGpuStatus = 'waiting'
+let gpuReason = 'waiting for manifest'
 let gpuFrameReady = false
 let gpuValidated = false
 let gpuDisabled = false
 let gpuValidationKey = ''
 let gpuFlipY = false
+
+const WEBGPU_MIN_CELLS = 10_000
+function webGpuEligible(spec: EncodingSpec | null | undefined): boolean {
+  return !!spec && spec.gridW * spec.gridH >= WEBGPU_MIN_CELLS
+}
+function createWebGpuSampler() {
+  webGpuSamplerPromise ??= WebGpuGridSampler.create()
+  return webGpuSamplerPromise
+}
 
 let t0 = 0
 let curDark = false
@@ -210,6 +242,10 @@ let curColorConfidence: number | undefined
 let curSpatialBlur: number | undefined
 let curWebGpu = false
 let curGpuSampleMs: number | undefined
+let curSenderFps: number | undefined
+let curTimingTick: number | undefined
+let curTimingLane: 0 | 1 | undefined
+let curDuplicateFrame = false
 
 // A single fountain frame is intentionally noise-like, therefore its neighbour
 // correlation is a useful instantaneous MTF/blur observation.  Smooth it across
@@ -235,6 +271,7 @@ function resetGpuValidation(): void {
   gpuDisabled = false
   gpuValidationKey = ''
   gpuFlipY = false
+  if (webGpuSampler) { gpuStatus = 'probing'; gpuReason = 'validating texture orientation' }
 }
 
 /**
@@ -269,7 +306,7 @@ function superFor(spec: EncodingSpec): SuperReceiver | null {
   return superRx
 }
 self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
-  const { pixels, bitmap, w, h, auto, spec, manifest, reset, id } = e.data
+  const { pixels, bitmap, w, h, auto, spec, manifest, reset, lastTimingTick, expectedLane, id } = e.data
   t0 = performance.now()
   curQuad = undefined
   curTracked = false
@@ -278,6 +315,10 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
   curSpatialBlur = undefined
   curWebGpu = false
   curGpuSampleMs = undefined
+  curSenderFps = undefined
+  curTimingTick = undefined
+  curTimingLane = undefined
+  curDuplicateFrame = false
   try {
     if (reset) { locked = null; lockedZm = null; lockedTransferId = null; rx = null; superRx = null; superKey = ''; superFusedLooks = 0; superWins = 0; resetSpatialCalibration(); resetGpuValidation(); fCursor = 0; pendingKey = ''; pendingCount = 0; sinceProgress = 0; barcodeSeen = false; trackState = null; trackVelocity = null; heldMapFrames = 0; trackingReady = false; trackingGood = 0; trackedFailures = 0 }
     // Once any worker has decoded the manifest, CameraReader forwards it to the
@@ -314,8 +355,23 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
       // WebGPU enters only after another worker has decoded and broadcast the
       // authoritative manifest, then it must pass the shadow comparison below.
       const gpuSpec = auto ? (lockedTransferId != null ? locked : null) : spec
-      if (gpuSpec && webGpuSampler === null) webGpuSampler = await webGpuSamplerPromise
-      gpuFrameReady = !!gpuSpec && !!webGpuSampler?.upload(bitmap, w, h)
+      const gpuEligible = webGpuEligible(gpuSpec)
+      if (gpuSpec && !gpuEligible) {
+        gpuStatus = 'rejected'
+        gpuReason = `CPU fast path selected for ${gpuSpec.gridW}x${gpuSpec.gridH} (GPU readback overhead)`
+      }
+      if (gpuEligible && !gpuInitAttempted) {
+        gpuInitAttempted = true
+        const init = await createWebGpuSampler()
+        webGpuSampler = init.sampler
+        gpuStatus = webGpuSampler ? 'probing' : 'unavailable'
+        gpuReason = webGpuSampler ? 'validating texture orientation' : init.reason
+      }
+      gpuFrameReady = gpuEligible && !!webGpuSampler?.upload(bitmap, w, h)
+      if (gpuEligible && webGpuSampler && !gpuFrameReady) {
+        gpuStatus = 'rejected'
+        gpuReason = 'camera texture upload failed'
+      }
       if (!offCanvas || offCanvas.width !== w || offCanvas.height !== h) {
         offCanvas = new OffscreenCanvas(w, h)
         offCtx = offCanvas.getContext('2d', { willReadFrequently: true })
@@ -328,27 +384,12 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
       px = new Uint8ClampedArray(pixels!)
     }
     { let s = 0, c = 0; const b = ((h >> 1) * w + (w >> 1)) * 4; for (let i = -32; i <= 32; i += 4) { const p = b + i * 4; s += px[p] * 0.299 + px[p + 1] * 0.587 + px[p + 2] * 0.114; c++ } curDark = s / c < 6 }
-    // Full detection every frame. The tracked fast-path (re-pinning finders around
-    // last frame's centres) was a big win for a STATIC propped scene, but on a
-    // hand-held receiver it pinned slightly-drifted maps between frames → the decode
-    // failed → BP ran every frame → the scan rate collapsed to a few fps. A fresh
-    // full locate each frame is a few ms more but gives an accurate map every time,
-    // so clean captures close on the cheap fast path (high fps). (`locateMatrixTracked`
-    // is kept in matrixVision for a future static-mode opt-in.)
-    // The tracked fast-path (re-pin finders around last frame's predicted centres)
-    // MUST stay off for a hand-held receiver: once tracking goes "ready" (8 decoded
-    // frames) it pins a slightly-drifted map between frames, the sample lands off the
-    // true cells, and decode then fails persistently — the map drift compounds across
-    // the transfer, which is exactly the "stalls after ~N chunks and the brackets
-    // vanish" field failure. Full detection every frame costs a few ms more but gives
-    // an accurate map every time (clean captures still close on the cheap fast path).
-    // The flag is kept so a propped/static mode can opt back in later.
-    // Keep prediction disabled on the live hand-held path. Local-threshold finder
-    // refinement improved acquisition, but it does not make a predicted window
-    // immune to accumulated sub-cell drift on 96/128 grids. Full locate still uses
-    // the new scale-invariant finder implementation, MTF equalisation and SIMD; only
-    // the unsafe reuse of previous geometry is disabled.
-    const USE_TRACKED_PREDICTION = false
+    // Strict tracked acquisition re-pins all four finders in the current exposure
+    // and skips only the coarse 224px keyline flood-fill. It never serves a held map
+    // or a partially reconstructed finder fit. noteTrack drops it after one failed
+    // decode, so handheld motion falls back to a fresh full locate on the next frame
+    // instead of accumulating the stale-map drift seen in the earlier CV-lock path.
+    const USE_TRACKED_PREDICTION = true
     let usedTracked = false
     let heldMap = false
     const predictedTrack = USE_TRACKED_PREDICTION && trackingReady && trackState
@@ -393,6 +434,24 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
 
     const known = auto ? locked : (spec ?? null)
     if (known) {
+      // The dedicated row is only 64 luminance samples. Read it before the full
+      // colour grid and LDPC work. A tick is skipped only when CameraReader says
+      // this lane already decoded it successfully, preserving repeat looks after
+      // a failed/blurred first exposure.
+      try {
+        const timingLum = sampleRowLum(px, w, h, map, known.gridW, known.gridH, TIMING_BARCODE_ROW)
+        const timing = decodeTimingBarcodeRow(timingLum, known.gridW)
+        if (timing && (expectedLane == null || timing.lane === expectedLane)) {
+          curSenderFps = timing.fps
+          curTimingTick = timing.tick
+          curTimingLane = timing.lane
+          if (lastTimingTick != null && timing.tick === lastTimingTick) {
+            curDuplicateFrame = true
+            reply({ id, result: null, found: true, looks: rx?.looks ?? 0, combinedWins: rx?.combinedWins ?? 0 })
+            return
+          }
+        }
+      } catch { /* timing is opportunistic; normal decode remains authoritative */ }
       const cap = lockedZm ? capacityBytesZoned(lockedZm) : capacityBytes(known)
       // Before the manifest, dense BW must attempt BP on the first capture. The
       // former defer=true setting could stay forever at look 1 under slight phone
@@ -404,7 +463,13 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
         // workers. A worker therefore usually sees a NEW fountain frame on its
         // next turn, not a repeat of the previous one. Deferring BP until a repeat
         // deadlocks all three workers at look 1 and yields 0/K forever.
-        rx = new SoftReceiver(cap, known.rate ?? 0.6, denseBw ? 12 : 24, false)
+        // Clean systematic frames still close through the CRC fast path. Marginal
+        // Color8 64² frames get a bounded 12-iteration rescue: successful WASM BP
+        // normally converges before that, while a hopeless frame can no longer pin
+        // one worker for the full 24 rounds. Fountain redundancy is more valuable
+        // than spending a second rescuing one equation.
+        const fastColor8 = known.enc === 'color8' && known.gridW <= 64 && known.gridH <= 64
+        rx = new SoftReceiver(cap, known.rate ?? 0.6, denseBw ? 12 : fastColor8 ? 12 : 24, false)
       }
       const cpuSample = (): CellReadings => known.enc === 'bw'
         ? sampleMappedBinary(px, w, h, map, known.gridW, known.gridH)
@@ -423,7 +488,9 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
             // for up to 12 frames, making the whole transfer feel heavier. Compare
             // a bounded luminance sample against the CPU coordinates instead and
             // choose the texture orientation with the stronger correlation.
+            const cpuStarted = performance.now()
             const cpu = cpuSample()
+            const cpuMs = performance.now() - cpuStarted
             const normalScore = luminanceAgreement(cpu, gpu.readings)
             const flipped = await webGpuSampler.sample(located.inner, known.gridW, known.gridH, known.enc === 'bw', !gpuFlipY)
             const flippedScore = flipped ? luminanceAgreement(cpu, flipped.readings) : -1
@@ -432,18 +499,37 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
               gpu = flipped
               curGpuSampleMs = gpu.ms
             }
-            if (Math.max(normalScore, flippedScore) >= 0.72) {
+            const agreement = Math.max(normalScore, flippedScore)
+            // Accuracy alone is not enough: on the measured 64² phone link the
+            // GPU was bit-exact (1.000) but its mapped readback took 61.6ms and
+            // raised whole-frame decode from ~211ms to ~267ms. Keep WebGPU only
+            // when one steady-state sample has a real margin over the CPU sampler.
+            // The generous 25%+4ms guard avoids rejecting a GPU because of timer
+            // noise, while immediately removing large readback regressions.
+            const gpuTooSlow = gpu.ms > cpuMs * 1.25 + 4
+            if (agreement >= 0.72 && !gpuTooSlow) {
               gpuValidated = true
               rawReadings = gpu.readings
               curWebGpu = true
+              gpuStatus = 'active'
+              gpuReason = `validated (${agreement.toFixed(3)}; GPU ${gpu.ms.toFixed(1)}ms vs CPU ${cpuMs.toFixed(1)}ms)`
             } else {
               rawReadings = cpu
               gpuDisabled = true
+              gpuStatus = 'rejected'
+              gpuReason = gpuTooSlow
+                ? `slower than CPU (GPU ${gpu.ms.toFixed(1)}ms vs CPU ${cpuMs.toFixed(1)}ms)`
+                : `sampling mismatch (${agreement.toFixed(3)})`
             }
           } else {
             rawReadings = gpu.readings
             curWebGpu = true
+            gpuStatus = 'active'
           }
+        } else {
+          gpuDisabled = true
+          gpuStatus = 'rejected'
+          gpuReason = 'GPU sample/readback failed'
         }
       }
       if (!rawReadings) rawReadings = cpuSample()
@@ -513,7 +599,7 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
       try {
         // Read the barcode STRIP (all BARCODE_ROWS rows averaged) at the geometry-
         // derived height — good enough to place row 0, since it's at the very top.
-        const rowLum = sampleBarcodeLum(px, w, h, map, gw, ghApprox, BARCODE_ROWS)
+        const rowLum = sampleBarcodeLum(px, w, h, map, gw, ghApprox, METADATA_BARCODE_ROWS)
         const bc = decodeBarcodeRow(rowLum, gw)
         if (!bc) continue
         if (bc.version !== BARCODE_VERSION) continue
@@ -529,6 +615,14 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
         const ratio = gh / Math.max(1, ghApprox)
         if (ratio < 0.6 || ratio > 1.7) continue
         const s: EncodingSpec = { enc: bc.enc, gridW: gw, gridH: gh, rate: bc.rate }
+        try {
+          const timing = decodeTimingBarcodeRow(sampleRowLum(px, w, h, map, gw, gh, TIMING_BARCODE_ROW), gw)
+          if (timing) {
+            curSenderFps = timing.fps
+            curTimingTick = timing.tick
+            curTimingLane = timing.lane
+          }
+        } catch { /* metadata lock remains valid without the timing row */ }
         const zm = (bc.zones && bc.enc !== 'bw') ? buildZoneMap(gw, gh, bc.enc, bc.ringWidth) : null
         hit = { spec: s, zm, lanes: bc.lanes ?? 1 }
         break
@@ -612,8 +706,8 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
   }
 }
 
-function reply(r: Omit<DecodeReply, 'ms' | 'wasm' | 'spatialSimd' | 'webGpu' | 'gpuSampleMs' | 'dark' | 'quad' | 'tracked' | 'phase' | 'colorConfidence' | 'superLooks' | 'superWins' | 'spatialBlur'>) {
-  ;(self as unknown as Worker).postMessage({ ...r, ms: performance.now() - t0, wasm: wasmActive, spatialSimd: spatialSimdActive, webGpu: curWebGpu, gpuSampleMs: curGpuSampleMs, dark: curDark, quad: curQuad, tracked: curTracked, phase: curPhase, colorConfidence: curColorConfidence, superLooks: superRx?.count ?? 0, superWins, spatialBlur: curSpatialBlur })
+function reply(r: Omit<DecodeReply, 'ms' | 'wasm' | 'spatialSimd' | 'webGpu' | 'gpuSampleMs' | 'webGpuStatus' | 'webGpuReason' | 'dark' | 'quad' | 'tracked' | 'phase' | 'colorConfidence' | 'superLooks' | 'superWins' | 'spatialBlur' | 'senderFps' | 'timingTick' | 'timingLane' | 'duplicateFrame'>) {
+  ;(self as unknown as Worker).postMessage({ ...r, ms: performance.now() - t0, wasm: wasmActive, spatialSimd: spatialSimdActive, webGpu: curWebGpu, gpuSampleMs: curGpuSampleMs, webGpuStatus: gpuStatus, webGpuReason: gpuReason, dark: curDark, quad: curQuad, tracked: curTracked, phase: curPhase, colorConfidence: curColorConfidence, superLooks: superRx?.count ?? 0, superWins, spatialBlur: curSpatialBlur, senderFps: curSenderFps, timingTick: curTimingTick, timingLane: curTimingLane, duplicateFrame: curDuplicateFrame })
 }
 
 function meanReliability(rel?: Float32Array): number | undefined {
@@ -629,4 +723,4 @@ function normQuad(c: Corners, w: number, h: number): NormQuad {
   return { tl: n(c.tl), tr: n(c.tr), br: n(c.br), bl: n(c.bl) }
 }
 
-export type { DecodeRequest, DecodeReply }
+export type { DecodeRequest }

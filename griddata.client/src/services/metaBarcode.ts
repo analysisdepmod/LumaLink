@@ -26,6 +26,10 @@
 import type { Encoding } from './visualCodec'
 
 export const BARCODE_ROWS = 3
+/** Rows 0-1 carry identical, full-contrast metadata copies. */
+export const METADATA_BARCODE_ROWS = 2
+/** Row 2 carries a changing timing word (fps/tick/lane). */
+export const TIMING_BARCODE_ROW = 2
 export const BARCODE_VERSION = 2
 
 const ENC_ORDER: Encoding[] = ['color64', 'color32', 'color16', 'color8', 'bw']
@@ -56,6 +60,15 @@ export interface BarcodeData {
   gridH: number
   /** Static display layout; bit-packed into unused grid-width metadata space. */
   lanes?: 1 | 2
+}
+
+export interface TimingBarcodeData {
+  /** Sender display cadence, represented in half-fps steps. */
+  fps: number
+  /** Logical sender tick, modulo 1024 on the wire. */
+  tick: number
+  /** Optical tile within one atomic Turbo exposure. */
+  lane: 0 | 1
 }
 
 export function rateToIdx(rate: number): number {
@@ -122,7 +135,7 @@ function buildPattern(data: BarcodeData): number[] {
 }
 
 /** Smallest grid width that can carry one full barcode copy. */
-export const MIN_BARCODE_WIDTH = PATTERN_LEN * BAR_CELLS // 60
+export const MIN_BARCODE_WIDTH = PATTERN_LEN * BAR_CELLS // 64
 
 /** Encode one barcode row as RGB bytes (gridW cells). Each pattern bar spans
  *  BAR_CELLS cells so it survives camera blur. The caller paints this same row
@@ -134,6 +147,30 @@ export function encodeBarcodeRow(data: BarcodeData, gridW: number): Uint8Array {
     const bar = Math.floor(i / BAR_CELLS)
     const bit = pattern[bar % PATTERN_LEN]
     const v = bit ? 255 : 0
+    out[i * 3] = out[i * 3 + 1] = out[i * 3 + 2] = v
+  }
+  return out
+}
+
+// Timing word uses the same proven 32-bar envelope and CRC-7 as metadata:
+//   sync(4) + timing-version(2) + fps×2(8) + tick(10) + lane(1) + CRC-7.
+// Its row is intentionally mid-contrast (85/170). Legacy receivers that average
+// all three top rows still see the two full-contrast metadata rows as a clean
+// majority, while a new receiver can threshold the timing row by itself.
+const TIMING_VERSION = 1
+export function encodeTimingBarcodeRow(data: TimingBarcodeData, gridW: number): Uint8Array {
+  const fpsHalf = Math.max(0, Math.min(255, Math.round(data.fps * 2)))
+  const dataBits = [
+    ...intToBits(TIMING_VERSION, 2),
+    ...intToBits(fpsHalf, 8),
+    ...intToBits(data.tick & 0x3FF, 10),
+    data.lane & 1,
+  ]
+  const pattern = [...SYNC, ...dataBits, ...intToBits(crc7(dataBits, DATA_BITS), CRC_BITS)]
+  const out = new Uint8Array(gridW * 3)
+  for (let i = 0; i < gridW; i++) {
+    const bit = pattern[Math.floor(i / BAR_CELLS) % PATTERN_LEN]
+    const v = bit ? 170 : 85
     out[i * 3] = out[i * 3 + 1] = out[i * 3 + 2] = v
   }
   return out
@@ -212,6 +249,43 @@ export function decodeBarcodeRow(lum: Float32Array, cellCount: number): BarcodeD
           return decodeFromBits(voted, 0)
       }
       return decodeFromBits(bits, off)
+    }
+  }
+  return null
+}
+
+/** Decode the dedicated timing row. CRC rejection makes this safe to probe before
+ * the expensive full-grid colour sample and LDPC pass. */
+export function decodeTimingBarcodeRow(lum: Float32Array, cellCount: number): TimingBarcodeData | null {
+  if (cellCount < MIN_BARCODE_WIDTH) return null
+  for (let phase = 0; phase < BAR_CELLS; phase++) {
+    const barCount = Math.floor((cellCount - phase) / BAR_CELLS)
+    if (barCount < PATTERN_LEN) continue
+    const barLum = new Float32Array(barCount)
+    for (let k = 0; k < barCount; k++) {
+      let sum = 0
+      for (let j = 0; j < BAR_CELLS; j++) sum += lum[phase + k * BAR_CELLS + j]
+      barLum[k] = sum / BAR_CELLS
+    }
+    const sorted = Float32Array.from(barLum).sort()
+    let threshold = (sorted[0] + sorted[barCount - 1]) / 2, bestGap = -1
+    for (let k = 1; k < barCount; k++) {
+      const gap = sorted[k] - sorted[k - 1]
+      if (gap > bestGap) { bestGap = gap; threshold = (sorted[k] + sorted[k - 1]) / 2 }
+    }
+    const bits = Array.from(barLum, v => v > threshold ? 1 : 0)
+    for (let off = 0; off <= Math.min(4, barCount - PATTERN_LEN); off++) {
+      let syncOk = true
+      for (let i = 0; i < SYNC.length; i++) if (bits[off + i] !== SYNC[i]) { syncOk = false; break }
+      if (!syncOk) continue
+      const dataBits = bits.slice(off + SYNC.length, off + SYNC.length + DATA_BITS)
+      const crc = bitsToInt(bits, off + SYNC.length + DATA_BITS, CRC_BITS)
+      if (crc7(dataBits, DATA_BITS) !== crc || bitsToInt(dataBits, 0, 2) !== TIMING_VERSION) continue
+      return {
+        fps: bitsToInt(dataBits, 2, 8) / 2,
+        tick: bitsToInt(dataBits, 10, 10),
+        lane: bitsToInt(dataBits, 20, 1) as 0 | 1,
+      }
     }
   }
   return null

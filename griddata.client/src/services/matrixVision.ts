@@ -157,7 +157,11 @@ function locateByKeyline(px: Uint8ClampedArray, w: number, h: number): Located |
  */
 export function locateMatrixTracked(px: Uint8ClampedArray, w: number, h: number, prev: TrackState): Located | null {
   const framePx = 10 * prev.ms // framePx = 2·(5·ms); see refineFromPredicted geometry
-  const ref = refineFromPredicted(px, w, h, prev.centers, framePx, prev.t)
+  // The tracked path is allowed to skip the coarse keyline detector only when
+  // every finder is freshly measured. Reconstructing one or two missing corners
+  // is useful during full acquisition, but unsafe for tracking: a reconstructed
+  // point can carry a small error forward until the sampling map drifts by a cell.
+  const ref = refineFromPredicted(px, w, h, prev.centers, framePx, prev.t, 4)
   if (!ref) return null
   if (!quadIsSquareEnough(ref.frame)) return null
   return buildLocated(ref.frame, ref.markers, { centers: ref.centers, ms: ref.ms, t: prev.t })
@@ -372,9 +376,10 @@ interface FinderFit { frame: Quad; markers: Quad; centers: [Pt, Pt, Pt, Pt]; ms:
  * frame's fit — either way we scan a small window at each predicted spot for the
  * 1:1:3:1:1 signature, pin the ones we find to sub-pixel accuracy, fill any we
  * miss from the prediction, then step the centres out to the marker/frame quads.
- * Returns null when fewer than three finders are found (caller falls back).
+ * Full acquisition accepts two measured corners; strict tracking raises the
+ * caller-provided minimum to four so no reconstructed corner can carry drift.
  */
-function refineFromPredicted(px: Uint8ClampedArray, w: number, h: number, predicted: Pt[], framePx: number, t: number): FinderFit | null {
+function refineFromPredicted(px: Uint8ClampedArray, w: number, h: number, predicted: Pt[], framePx: number, t: number, minFound = 2): FinderFit | null {
   // Below ~8 px the marker rings are too small to resolve the 1:1:3:1:1 runs.
   if (framePx < 8) return null
   const res = predicted.map(c => findFinderNear(px, w, h, c.x, c.y, framePx, t))
@@ -385,7 +390,7 @@ function refineFromPredicted(px: Uint8ClampedArray, w: number, h: number, predic
   // That is far better than dropping to the geometric-quad fallback (ZERO measured
   // corners) just because one or two corners are washed out by screen glare — the
   // observed field case where fpx grew and detection fell from F4 to F2, stalling.
-  if (nFound < 2) return null
+  if (nFound < minFound) return null
   const msVals = res.filter(r => r.ok).map(r => r.ms)
   const ms = msVals.reduce((a, b) => a + b, 0) / msVals.length
   // Reconstruct any MISSING finder corner from a SQUARE (similarity) fit through the
@@ -468,6 +473,23 @@ export function sampleMapped(px: Uint8ClampedArray, w: number, h: number, map: G
  * still measured and fed into the same soft decoder / temporal combiner.
  */
 const EMPTY_BINARY_CHANNEL = new Float32Array(0)
+
+// Per-worker sampling buffers. A worker handles one request at a time and every
+// consumer completes synchronously before the next sample, so retaining one exact-
+// sized set removes five typed-array allocations per camera exposure without any
+// cross-frame aliasing. Exact sizes matter because downstream filters use .length.
+const COLOR_SAMPLE_SCRATCH = new Map<number, CellReadings>()
+function colorSamplingScratch(n: number): CellReadings {
+  let rd = COLOR_SAMPLE_SCRATCH.get(n)
+  if (!rd) {
+    rd = {
+      r: new Float32Array(n), g: new Float32Array(n), b: new Float32Array(n),
+      lum: new Float32Array(n), rel: new Float32Array(n),
+    }
+    COLOR_SAMPLE_SCRATCH.set(n, rd)
+  }
+  return rd
+}
 
 export function sampleMappedBinary(px: Uint8ClampedArray, w: number, h: number, map: GridMap, gridW: number, gridH: number): CellReadings {
   const n = gridW * gridH
@@ -712,13 +734,18 @@ function sampleHomography(
   map: (u: number, v: number) => Pt, gridW: number, gridH: number,
 ): CellReadings {
   const n = gridW * gridH
-  const r = new Float32Array(n), g = new Float32Array(n), b = new Float32Array(n), lum = new Float32Array(n)
-  const rel = new Float32Array(n)
+  const scratch = colorSamplingScratch(n)
+  const { r, g, b, lum } = scratch
+  const rel = scratch.rel!
   const c00 = map(0, 0), c10 = map(1, 0), c01 = map(0, 1)
   const cellPxW = Math.hypot(c10.x - c00.x, c10.y - c00.y) / gridW
   const cellPxH = Math.hypot(c01.x - c00.x, c01.y - c00.y) / gridH
   const cellPx = Math.min(cellPxW, cellPxH)
-  const win = Math.max(0, Math.floor(cellPx / 4))
+  // A 5×5 centre window is already larger than the useful Bayer footprint of
+  // a photographed 64² Color8 cell. The former unbounded 7×7/9×9 window
+  // nearly doubled sampling work and increasingly mixed neighbour symbols as the
+  // matrix moved closer to the camera. Dense grids naturally select a smaller win.
+  const win = Math.min(2, Math.max(0, Math.floor(cellPx / 4)))
   // A crisp, well-focused cell reads nearly UNIFORM inside its sampling window;
   // a blurred cell — or one straddling a neighbour because registration drifted —
   // reads with high internal luminance variance. We turn that variance into an

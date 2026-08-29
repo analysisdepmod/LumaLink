@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { Space, Tag, Button, Tooltip } from 'antd'
 import {
   PauseOutlined, PlayCircleOutlined,
   FullscreenOutlined, FullscreenExitOutlined,
 } from '@ant-design/icons'
 import { encodeCellsRGB, encodeCellsRGBZoned, type EncodingSpec, type ZoneMap } from '../services/visualCodec'
-import { encodeBarcodeRow, BARCODE_ROWS, type BarcodeData } from '../services/metaBarcode'
+import { encodeBarcodeRow, encodeTimingBarcodeRow, METADATA_BARCODE_ROWS, TIMING_BARCODE_ROW, type BarcodeData } from '../services/metaBarcode'
 import { FRAME_RATIO, QUIET_RATIO, FINDER_SIZE_FRAC } from '../services/matrixVision'
 
 interface Props {
@@ -22,6 +22,14 @@ interface Props {
   frameStride?: number
   /** Display each logical frame for this many sender ticks (temporal combining). */
   holdTicks?: number
+  /** Shared sender clock. Turbo supplies this so both optical lanes paint atomically. */
+  frameIndex?: number
+  /** Physical optical lane encoded into the timing strip. */
+  lane?: 0 | 1
+}
+
+export interface VisualMatrixHandle {
+  drawFrame(index: number): void
 }
 
 // Discovery must work even when the receiver opens midway through a transfer.
@@ -205,7 +213,7 @@ function initGL(canvas: HTMLCanvasElement): GlState | null {
   }
 }
 
-export default function VisualMatrix({ frameAt, frameCount, spec, fps, zoneMap, barcode, compact = false, frameOffset = 0, frameStride = 1, holdTicks = 1 }: Props) {
+const VisualMatrix = forwardRef<VisualMatrixHandle, Props>(function VisualMatrix({ frameAt, frameCount, spec, fps, zoneMap, barcode, compact = false, frameOffset = 0, frameStride = 1, holdTicks = 1, frameIndex, lane = 0 }, ref) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
   const glRef = useRef<GlState | null>(null)
@@ -264,6 +272,9 @@ export default function VisualMatrix({ frameAt, frameCount, spec, fps, zoneMap, 
   const drawFrameNo = useCallback((idx: number) => {
     const canvas = canvasRef.current
     if (!canvas || !frameCount) return
+    // Lightweight sender telemetry/debug hook. It also lets local verification
+    // measure the real painted cadence without reading back the large WebGL canvas.
+    canvas.dataset.frameIndex = String(idx)
     // Turbo tiles do not create a second transfer.  They take disjoint frames
     // from the same fountain carousel, so every frame recovered by either tile
     // feeds the one decoder on the receiver.
@@ -294,13 +305,15 @@ export default function VisualMatrix({ frameAt, frameCount, spec, fps, zoneMap, 
       [finderCtrX, canvasH - finderCtrY],       // bottom-left
       [canvasW - finderCtrX, canvasH - finderCtrY], // bottom-right
     ]
-    // The barcode occupies rows reserved by visualCodec, outside the LDPC payload.
-    // Keeping it static in every frame makes auto-detection stable on mobile cameras.
+    // Rows 0-1 retain the full-contrast metadata lock. Row 2 carries a changing,
+    // CRC-protected timing word so the receiver knows the sender clock before
+    // spending CPU on the full colour grid. Its lower contrast preserves a clean
+    // metadata majority for older receivers that average all three rows.
     if (barcode) {
       const br = encodeBarcodeRow(barcode, gridW)
-      // Paint the same strip into all BARCODE_ROWS top rows so the receiver can
-      // average them for a clean read (and it reads as a real, visible barcode).
-      for (let r = 0; r < BARCODE_ROWS; r++) rgb.set(br, r * gridW * 3)
+      for (let r = 0; r < METADATA_BARCODE_ROWS; r++) rgb.set(br, r * gridW * 3)
+      const timing = encodeTimingBarcodeRow({ fps, tick: logicalIndex, lane }, gridW)
+      rgb.set(timing, TIMING_BARCODE_ROW * gridW * 3)
     }
     const n = gridW * gridH
 
@@ -369,31 +382,60 @@ export default function VisualMatrix({ frameAt, frameCount, spec, fps, zoneMap, 
     cctx.putImageData(img, 0, 0)
     ctx.imageSmoothingEnabled = false
     ctx.drawImage(cellCanvas, 0, 0, gridW, gridH, offX, offY, drawDataW, drawDataH)
-  }, [frameAt, frameCount, spec, gridW, gridH, dataW, dataH, canvasW, canvasH, bootstrapScale, cellCanvas, texBuf, zoneMap, barcode, holdTicks])
+  }, [frameAt, frameCount, spec, gridW, gridH, dataW, dataH, canvasW, canvasH, bootstrapScale, cellCanvas, texBuf, zoneMap, barcode, holdTicks, fps, lane])
 
   const isStatic = frameCount <= 1
 
-  useEffect(() => {
-    idxRef.current = 0
-    drawFrameNo(0)
-  }, [frameCount, drawFrameNo])
+  useImperativeHandle(ref, () => ({
+    drawFrame(index: number) {
+      idxRef.current = index
+      drawFrameNo(index)
+    },
+  }), [drawFrameNo])
 
   useEffect(() => {
-    if (isStatic || !isPlaying || !frameCount) return
+    // Externally clocked Turbo lanes are drawn by the layout effect below. The
+    // old standalone initializer depended on drawFrameNo; Turbo refreshes its
+    // barcode props while ticking, so this effect ran after every paint and put
+    // the canvas straight back on frame zero, making the matrix look frozen.
+    if (frameIndex != null) return
+    idxRef.current = 0
+    drawFrameNo(0)
+  }, [frameIndex, frameCount, drawFrameNo])
+
+  // Draw both Turbo children during the same pre-paint layout-effect flush. A
+  // post-paint effect can expose one updated canvas for a display refresh before
+  // React reaches its sibling, recreating the old/new optical pair tear.
+  useLayoutEffect(() => {
+    if (frameIndex == null) return
+    idxRef.current = frameIndex
+    drawFrameNo(frameIndex)
+  }, [frameIndex, drawFrameNo])
+
+  useEffect(() => {
+    // Turbo owns one shared clock. Running a private rAF loop in each lane lets
+    // their paint deadlines drift apart, producing torn old/new optical pairs.
+    if (frameIndex != null || isStatic || !isPlaying || !frameCount) return
     let raf = 0
     let last = performance.now()
     const interval = 1000 / fps
     const loop = (now: number) => {
-      if (now - last >= interval) {
-        last = now
-        idxRef.current = (idxRef.current + 1) % (frameCount * Math.max(1, holdTicks))
+      const elapsed = now - last
+      if (elapsed >= interval) {
+        // Carry the ideal deadline forward. Assigning `last = now` quantizes an
+        // advertised 9/12fps carousel to the next 60Hz paint boundary and loses
+        // rate on every tick. If rendering was genuinely paused, skip stale
+        // symbols instead of bursting them; fountain transport tolerates gaps.
+        const ticks = Math.max(1, Math.floor(elapsed / interval))
+        last += ticks * interval
+        idxRef.current = (idxRef.current + ticks) % (frameCount * Math.max(1, holdTicks))
         drawFrameNo(idxRef.current)
       }
       raf = requestAnimationFrame(loop)
     }
     raf = requestAnimationFrame(loop)
     return () => cancelAnimationFrame(raf)
-  }, [isStatic, isPlaying, fps, frameCount, drawFrameNo, holdTicks])
+  }, [frameIndex, isStatic, isPlaying, fps, frameCount, drawFrameNo, holdTicks])
 
 
   useEffect(() => {
@@ -474,4 +516,6 @@ export default function VisualMatrix({ frameAt, frameCount, spec, fps, zoneMap, 
 
     </div>
   )
-}
+})
+
+export default VisualMatrix

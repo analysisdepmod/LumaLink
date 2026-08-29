@@ -36,7 +36,7 @@ export const FRAME_TYPE_DATA = 1
 export const FRAME_TYPE_SOLO = 2 // whole transfer in one static frame
 
 export interface TransferManifest {
-  v: 1 | 2 | 3 | 4 | 5 | 6
+  v: 1 | 2 | 3 | 4 | 5 | 6 | 7
   id: number            // random id — receiver detects a new transfer by this
   kind: 'file' | 'text'
   name: string          // filename ('' for text)
@@ -63,7 +63,7 @@ export function isValidManifest(value: unknown): value is TransferManifest {
   const finite = (n: unknown, min: number, max: number): n is number => typeof n === 'number' && Number.isInteger(n) && n >= min && n <= max
   const gridW = m.gridW
   const gridH = m.gridH
-  return (m.v === 1 || m.v === 2 || m.v === 3 || m.v === 4 || m.v === 5 || m.v === 6)
+  return (m.v === 1 || m.v === 2 || m.v === 3 || m.v === 4 || m.v === 5 || m.v === 6 || m.v === 7)
     && finite(m.id, 0, 0xFFFF_FFFF)
     && (m.kind === 'file' || m.kind === 'text')
     && typeof m.name === 'string' && m.name.length <= 512
@@ -86,6 +86,7 @@ export interface BuildOptions {
   zoneMap?: ZoneMap          // adaptive spatial coding zone map
   zoneRingWidth?: number     // ring width used to build the zone map (for manifest)
   fps?: number               // actual display rate selected by the sender
+  lanes?: 1 | 2              // optical tiles advanced on every display tick
   /** Direct source frames emitted between repair equations (Fast can use a longer run). */
   systematicRun?: number
 }
@@ -467,7 +468,7 @@ export function decodeManifestWire(body: Uint8Array, optical?: EncodingSpec): Tr
       const view = new DataView(body.buffer, body.byteOffset, body.byteLength)
       let off = 3
       const v = body[off++]
-      if (v !== 6) return null
+      if (v !== 6 && v !== 7) return null
       const id = view.getUint32(off, true); off += 4
       const flags = body[off++]!
       const fps10 = view.getUint16(off, true); off += 2
@@ -646,7 +647,7 @@ export async function buildTransfer(
   const solo = buildSolo(meta, opts.spec, packed, sha256, zm)
   if (solo) {
     const manifest: TransferManifest = {
-      v: zm ? 5 : 6, id: randomTransferId(),
+      v: zm ? 5 : 7, id: randomTransferId(),
       kind: meta.kind, name: meta.name, mime: meta.mime,
       total: raw.length, comp: packed.bytes.length, compressed: packed.compressed, sha256,
       k: 1, chunk: packed.bytes.length,
@@ -660,7 +661,7 @@ export async function buildTransfer(
   const k = Math.max(1, Math.ceil(packed.bytes.length / chunkSize))
 
   const manifest: TransferManifest = {
-    v: zm ? 5 : 6,
+    v: zm ? 5 : 7,
     id: randomTransferId(),
     kind: meta.kind,
     name: meta.name,
@@ -709,22 +710,31 @@ export async function buildTransfer(
   // Dense BW gets a longer one-time acquisition preamble. Periodic metadata stays
   // a SINGLE frame: a multi-frame burst looked like the sender froze every few
   // seconds and consumed payload time after the receiver already knew K.
-  const leadingManifestCount = manifestFrames.length * 10
+  // Count optical frames, not screen ticks. Turbo consumes two carousel frames
+  // per tick, so the old fixed 10-frame lead lasted only ~0.42s at 12fps and
+  // payload arrived while the receiver was still assembling the manifest.
+  // Give every layout about 1.5 seconds of stable bootstrap before data starts.
+  const bootstrapOpticalFrames = Math.ceil((opts.fps ?? 6.5) * (opts.lanes ?? 1) * 1.5)
+  const leadingManifestCount = manifestFrames.length * Math.max(10,
+    Math.ceil(bootstrapOpticalFrames / manifestFrames.length))
   const manifestBurst = manifestFrames.length
-  // v4 mapping: a medium-wide repair every second repair. It has a materially
-  // shorter completion tail at the measured 84–88% frame-validity range.
+  // Keep medium-wide repairs at every second repair. Making every repair wide
+  // looked better under IID loss, but Turbo drops/skips adjacent lane frames in
+  // pairs. The real field run then needed 751 equations, and a deterministic
+  // paired-loss model could fail to close entirely. The 4+1 cadence remains;
+  // w2 is the robust mapping for both random and paired optical loss.
   const mediumWideEvery = 2
   const fullGroups = Math.floor(dataFrameCount / manifestEvery)
   const remainder = dataFrameCount % manifestEvery
   const frameCount = leadingManifestCount + fullGroups * (manifestEvery + manifestBurst) + remainder
-  // A compact LRU removes the former O(file size) frame allocation. It retains a
-  // short render window only, while repeated frame cycles remain deterministic.
+  // A compact LRU keeps large transfers bounded. For the common short/medium
+  // transfer, precompute one complete optical carousel before playback: doing
+  // fountain XOR + LDPC packing inside requestAnimationFrame made the sender
+  // occasionally hold one symbol for several camera exposures, which surfaced
+  // as a random burst of duplicate seeds on an otherwise clean link.
   const cache = new Map<number, Uint8Array>()
   const CACHE_LIMIT = 24
-  const frameAt = (requested: number): Uint8Array => {
-    const index = ((requested % frameCount) + frameCount) % frameCount
-    const hit = cache.get(index)
-    if (hit) return hit
+  const renderFrame = (index: number): Uint8Array => {
     let frame: Uint8Array
     if (index < leadingManifestCount) {
       frame = manifestFrames[index % manifestFrames.length]!
@@ -741,6 +751,18 @@ export async function buildTransfer(
         frame = packFrame(FRAME_TYPE_DATA, seed, fountainEncodePayload(packed.bytes, k, seed, chunkSize, mediumWideEvery), capacity, rate)
       }
     }
+    return frame
+  }
+  const PRECOMPUTE_LIMIT = 2500
+  const precomputed = frameCount <= PRECOMPUTE_LIMIT
+    ? Array.from({ length: frameCount }, (_, index) => renderFrame(index))
+    : null
+  const frameAt = (requested: number): Uint8Array => {
+    const index = ((requested % frameCount) + frameCount) % frameCount
+    if (precomputed) return precomputed[index]
+    const hit = cache.get(index)
+    if (hit) return hit
+    const frame = renderFrame(index)
     cache.set(index, frame)
     if (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value as number)
     return frame
