@@ -92,7 +92,7 @@ test('timing barcode carries fractional fps, rolling tick, and lane', () => {
   assert.deepEqual(decodeTimingBarcodeRow(luminance, 64), { fps: 12.5, tick: 1733 & 0x3ff, lane: 1 })
 })
 
-test('two metadata rows outvote the mid-contrast timing row for legacy readers', () => {
+test('two metadata rows outvote the stronger timing row for legacy readers', () => {
   const metadata = encodeBarcodeRow({ version: 2, enc: 'color8', rate: 0.625, zones: false, ringWidth: 0, gridW: 64, gridH: 64, lanes: 2 }, 64)
   const timing = encodeTimingBarcodeRow({ fps: 12, tick: 777, lane: 0 }, 64)
   const averaged = new Float32Array(64)
@@ -338,6 +338,20 @@ test('v8 compact manifest selects the packed-tail repair protocol', () => {
   }
   const wire = encodeManifestWire(manifest)
   assert.deepEqual(decodeManifestWire(wire, { enc: 'color8', gridW: 64, gridH: 64, rate: 0.625 }), manifest)
+})
+
+test('v9 compact manifest selects the field-proven mixed repair protocol', () => {
+  const manifest: TransferManifest = {
+    v: 9, id: 45, kind: 'file', name: 'sample.pdf', mime: 'application/pdf',
+    total: 416638, comp: 415620, compressed: true, sha256: 'e'.repeat(64),
+    k: 461, chunk: 902, enc: 'color8', gridW: 64, gridH: 64, rate: 0.625, fps: 12,
+  }
+  const wire = encodeManifestWire(manifest)
+  assert.deepEqual(decodeManifestWire(wire, { enc: 'color8', gridW: 64, gridH: 64, rate: 0.625 }), manifest)
+  assert.deepEqual(
+    Array.from({ length: 10 }, (_, index) => seedForDataIndex(index, manifest.k, 8)),
+    [1, 2, 3, 4, 5, 6, 7, 8, 462, 9],
+  )
 })
 
 test('robust bootstrap manifest may use a lower LDPC rate than its payload', () => {

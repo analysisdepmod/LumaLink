@@ -154,9 +154,10 @@ export function encodeBarcodeRow(data: BarcodeData, gridW: number): Uint8Array {
 
 // Timing word uses the same proven 32-bar envelope and CRC-7 as metadata:
 //   sync(4) + timing-version(2) + fps×2(8) + tick(10) + lane(1) + CRC-7.
-// Its row is intentionally mid-contrast (85/170). Legacy receivers that average
+// Its row retains bounded contrast (32/223). Legacy receivers that average
 // all three top rows still see the two full-contrast metadata rows as a clean
-// majority, while a new receiver can threshold the timing row by itself.
+// majority, while the wider timing separation survives camera blur/exposure well
+// enough to reject duplicate ticks before the expensive full-grid LDPC pass.
 const TIMING_VERSION = 1
 export function encodeTimingBarcodeRow(data: TimingBarcodeData, gridW: number): Uint8Array {
   const fpsHalf = Math.max(0, Math.min(255, Math.round(data.fps * 2)))
@@ -170,7 +171,7 @@ export function encodeTimingBarcodeRow(data: TimingBarcodeData, gridW: number): 
   const out = new Uint8Array(gridW * 3)
   for (let i = 0; i < gridW; i++) {
     const bit = pattern[Math.floor(i / BAR_CELLS) % PATTERN_LEN]
-    const v = bit ? 170 : 85
+    const v = bit ? 223 : 32
     out[i * 3] = out[i * 3 + 1] = out[i * 3 + 2] = v
   }
   return out

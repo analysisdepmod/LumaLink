@@ -67,10 +67,10 @@ export default function SendPage() {
   // v7: four systematic chunks followed by one repair. Repairs retain the
   // paired-loss-safe w2 mapping selected in transferCodec; the shorter direct
   // run spreads recovery equations earlier without the failed all-wide tail.
-  // v8's packed dense tail makes every medium-wide repair rank-useful. Four
-  // systematic chunks per repair now closes 7–9% earlier across clean, loaded,
-  // and paired-burst Turbo models without recreating the old slow tail.
-  const systematicRun = 4
+  // v9 keeps the field-proven eight systematic chunks per repair. It reaches the
+  // complete source pass earlier than v8's 4:1 schedule, while the timer-free
+  // packed tail worker closes losses without the former end-of-transfer pause.
+  const systematicRun = 8
   const hasSource = source === 'file' ? !!file : text.trim().length > 0
   const resetBuilt = () => setBuilt(null)
   const chooseProfile = (key: ProfileKey) => { const next = PROFILES[key]; setProfile(key); setEnc(next.enc); setGrid(next.grid); setFps(next.fps); setRate(next.rate); setTurboLanes(next.lanes); setUseZones(false); resetBuilt() }

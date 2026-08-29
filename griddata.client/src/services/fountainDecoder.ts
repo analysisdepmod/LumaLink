@@ -119,6 +119,7 @@ export class FountainDecoder {
   private tailSolveTicks = 0
   private denseTailAttempts = 0
   private denseTailChunks = 0
+  private denseTailMs = 0
   private tailWorker: Worker | null = null
   private tailSolveInFlight = false
   private tailWorkerDisabled = false
@@ -135,6 +136,7 @@ export class FountainDecoder {
   get receivedEquations(): number { return this.seenSeeds.size }
   get tailSolverAttempts(): number { return this.denseTailAttempts }
   get tailSolverChunks(): number { return this.denseTailChunks }
+  get tailSolverMs(): number { return this.denseTailMs }
 
   dispose(): void {
     this.tailWorker?.terminate()
@@ -203,8 +205,9 @@ export class FountainDecoder {
     this.tailSolveInFlight = true
     try {
       this.tailWorker ??= new Worker(new URL('./fountainTailWorker.ts', import.meta.url), { type: 'module' })
-      this.tailWorker.onmessage = (event: MessageEvent<{ values: DenseTailValue[] | null }>) => {
+      this.tailWorker.onmessage = (event: MessageEvent<{ values: DenseTailValue[] | null; ms?: number }>) => {
         this.tailSolveInFlight = false
+        this.denseTailMs += event.data.ms ?? 0
         this.applyDenseTail(event.data.values, missing)
       }
       this.tailWorker.onerror = () => {

@@ -39,7 +39,7 @@ interface Result_ {
   bytes: Uint8Array
   url?: string
   text?: string
-  benchmark?: { seconds: number; goodputKBs: number; validFrames: number; attempts: number; verified: boolean; report: string; calibration: OpticalCalibration | null }
+  benchmark?: { seconds: number; goodputKBs: number; applicationGoodputKBs: number; validFrames: number; attempts: number; verified: boolean; report: string; calibration: OpticalCalibration | null }
 }
 
 const EMPTY: Snapshot = { k: 0, unique: 0, quality: 0, speed: 0, averageSpeed: 0, eta: -1, manifestSeen: false, attempts: 0, scanRate: 0, combinedWins: 0 }
@@ -115,7 +115,8 @@ export default function ReceivePage() {
     playChannelTone('complete', soundEnabledRef.current)
     const started = runRef.current.firstDataAt || runRef.current.firstValidAt
     const seconds = started ? (performance.now() - started) / 1000 : 0
-    const goodputKBs = seconds > 0 ? bytes.length / 1024 / seconds : 0
+    const applicationGoodputKBs = seconds > 0 ? bytes.length / 1024 / seconds : 0
+    const goodputKBs = seconds > 0 ? (manifest?.comp ?? bytes.length) / 1024 / seconds : 0
     const validFrameRate = attemptsRef.current ? runRef.current.validFrames / attemptsRef.current : 0
     const calibration = manifest ? assessOpticalLink({
       goodputKBs,
@@ -128,12 +129,14 @@ export default function ReceivePage() {
       colorConfidence: statsRef.current.colorConfidence,
     }) : null
     const benchmark = {
-      seconds, goodputKBs, validFrames: runRef.current.validFrames, attempts: attemptsRef.current, verified, calibration,
+      seconds, goodputKBs, applicationGoodputKBs, validFrames: runRef.current.validFrames, attempts: attemptsRef.current, verified, calibration,
       report: JSON.stringify({
         report: 'LumaLink optical-transfer benchmark',
         timestamp: new Date().toISOString(),
         result: { name, mime, bytes: bytes.length, sha256Verified: verified },
         goodputKBs: Number(goodputKBs.toFixed(2)),
+        opticalGoodputKBs: Number(goodputKBs.toFixed(2)),
+        applicationGoodputKBs: Number(applicationGoodputKBs.toFixed(2)),
         transferSeconds: Number(seconds.toFixed(3)),
         validFrames: runRef.current.validFrames,
         workerReplies: attemptsRef.current,
@@ -187,10 +190,11 @@ export default function ReceivePage() {
           superResWins: statsRef.current.superWins,
         },
         fountain: decoderRef.current ? {
-          repairProfile: manifest?.v && manifest.v >= 8 ? '4:1-wide-packed128' : 'legacy',
+          repairProfile: manifest?.v && manifest.v >= 9 ? '8:1-mixed-packed128' : manifest?.v === 8 ? '4:1-wide-packed128' : 'legacy',
           receivedEquations: decoderRef.current.receivedEquations,
           tailSolverAttempts: decoderRef.current.tailSolverAttempts,
           tailSolverChunks: decoderRef.current.tailSolverChunks,
+          tailSolverMs: Number(decoderRef.current.tailSolverMs.toFixed(2)),
         } : null,
         calibration,
         counters: diagRef.current,
@@ -272,11 +276,11 @@ export default function ReceivePage() {
       if (!manifestRef.current || manifestRef.current.id !== m.id) {
         manifestRef.current = m
         setManifestEpoch(epoch => epoch + 1)
-        // v8 makes every repair medium-wide for the packed dense-tail solver.
-        // Keep every older seed mapping intact so interrupted transfers remain
-        // decodable after updating this receiver.
+        // v8 makes every repair medium-wide; v9 restores the field-proven
+        // alternating graph. Keep every older mapping intact so interrupted
+        // transfers remain decodable after updating this receiver.
         decoderRef.current?.dispose()
-        const nextDecoder = new FountainDecoder(m.k, m.chunk, m.v >= 3, m.v >= 8 ? 1 : m.v >= 4 ? 2 : 4, () => {
+        const nextDecoder = new FountainDecoder(m.k, m.chunk, m.v >= 3, m.v === 8 ? 1 : m.v >= 4 ? 2 : 4, () => {
           if (decoderRef.current === nextDecoder && nextDecoder.isComplete) void finish()
         })
         decoderRef.current = nextDecoder
@@ -372,7 +376,7 @@ export default function ReceivePage() {
             type="info"
             showIcon
             style={{ marginBottom: 16 }}
-            message={`Benchmark: ${result.benchmark.goodputKBs.toFixed(1)} KB/s in ${result.benchmark.seconds.toFixed(2)} s`}
+            message={`Optical: ${result.benchmark.goodputKBs.toFixed(1)} KB/s · File effective: ${result.benchmark.applicationGoodputKBs.toFixed(1)} KB/s · ${result.benchmark.seconds.toFixed(2)} s`}
             description={`Valid frames: ${result.benchmark.validFrames}/${result.benchmark.attempts}${result.benchmark.verified ? ' · SHA-256 verified' : ''}`}
           />
         )}
@@ -380,7 +384,8 @@ export default function ReceivePage() {
           <Card size="small" title="Benchmark report" style={{ marginBottom: 16 }}>
             <Space wrap style={{ marginBottom: 10 }}>
               <Tag color="blue">File: {(result.bytes.length / 1024).toFixed(2)} KiB</Tag>
-              <Tag color="green">Goodput: {result.benchmark.goodputKBs.toFixed(1)} KB/s</Tag>
+              <Tag color="green">Optical: {result.benchmark.goodputKBs.toFixed(1)} KB/s</Tag>
+              <Tag color="cyan">File effective: {result.benchmark.applicationGoodputKBs.toFixed(1)} KB/s</Tag>
               <Tag color={result.benchmark.verified ? 'success' : 'warning'}>{result.benchmark.verified ? 'SHA-256 verified' : 'No SHA-256'}</Tag>
             </Space>
             {result.benchmark.calibration && (
