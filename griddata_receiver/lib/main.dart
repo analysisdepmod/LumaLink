@@ -118,9 +118,6 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   }
 
   void _onFrame(CameraImage image) {
-    final decoder = _decodeRequests;
-    if (_busy || decoder == null || image.planes.length < 3) return;
-    final nowUs = DateTime.now().microsecondsSinceEpoch;
     _windowFrames++;
     final elapsed = DateTime.now().difference(_windowStarted).inMilliseconds;
     if (elapsed >= 500 && mounted) {
@@ -128,6 +125,9 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       _windowFrames = 0;
       _windowStarted = DateTime.now();
     }
+    final decoder = _decodeRequests;
+    if (_busy || decoder == null || image.planes.length < 3) return;
+    final nowUs = DateTime.now().microsecondsSinceEpoch;
     // Synchronize native capture with the sender's CRC-protected timing row.
     if (nowUs < _nextDecodeUs) return;
     _nextDecodeUs = nowUs + (1000000 / _senderFps.clamp(2, 30)).round();

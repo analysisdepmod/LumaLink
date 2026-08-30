@@ -49,12 +49,47 @@ double _llrFor(double channel, double reliability) {
   return llr;
 }
 
+(double, double) _adaptiveBinaryModel(Float32List channel, int from, int to) {
+  final histogram = Int32List(256);
+  for (var i = from; i < to; i++) {
+    histogram[channel[i].round().clamp(0, 255)]++;
+  }
+  final count = to - from;
+  int percentile(double fraction) {
+    final target = (count * fraction).round();
+    var seen = 0;
+    for (var value = 0; value < histogram.length; value++) {
+      seen += histogram[value];
+      if (seen >= target) return value;
+    }
+    return 255;
+  }
+
+  final dark = percentile(0.1).toDouble();
+  final light = percentile(0.9).toDouble();
+  return ((dark + light) * 0.5, 8 / (light - dark).clamp(16, 255));
+}
+
+double _adaptiveLlr(
+  double value,
+  double midpoint,
+  double scale,
+  double reliability,
+) {
+  final llr = (midpoint - value) * scale * reliability.clamp(0, 1);
+  return llr.clamp(-20, 20).toDouble();
+}
+
 /// Produces GridData's transmitted-bit LLRs from a perspective-rectified,
 /// per-cell RGB read. The three barcode rows are deliberately excluded.
 Float64List softDemodulateColor8(Color8Grid grid) {
   final capacity = color8CapacityBytes(grid.gridWidth, grid.gridHeight);
   final output = Float64List(capacity * 8);
   final firstDataCell = grid.gridWidth * barcodeRows;
+  final cells = grid.gridWidth * grid.gridHeight;
+  final redModel = _adaptiveBinaryModel(grid.red, firstDataCell, cells);
+  final greenModel = _adaptiveBinaryModel(grid.green, firstDataCell, cells);
+  final blueModel = _adaptiveBinaryModel(grid.blue, firstDataCell, cells);
   var out = 0;
   for (
     var cell = firstDataCell;
@@ -62,11 +97,26 @@ Float64List softDemodulateColor8(Color8Grid grid) {
     cell++
   ) {
     final reliability = grid.reliability[cell];
-    output[out++] = _llrFor(grid.red[cell], reliability);
+    output[out++] = _adaptiveLlr(
+      grid.red[cell],
+      redModel.$1,
+      redModel.$2,
+      reliability,
+    );
     if (out >= output.length) break;
-    output[out++] = _llrFor(grid.green[cell], reliability);
+    output[out++] = _adaptiveLlr(
+      grid.green[cell],
+      greenModel.$1,
+      greenModel.$2,
+      reliability,
+    );
     if (out >= output.length) break;
-    output[out++] = _llrFor(grid.blue[cell], reliability);
+    output[out++] = _adaptiveLlr(
+      grid.blue[cell],
+      blueModel.$1,
+      blueModel.$2,
+      reliability,
+    );
   }
   return output;
 }

@@ -6,12 +6,17 @@ compact manifests, SHA-256 verification, and the bounded 128-chunk Fountain
 tail solver.
 
 The ready-to-install APK is published at
-`releases/LumaLink-Receiver-v2.0.1.apk`. Android may ask you to allow installing
+`releases/LumaLink-Receiver-v2.0.2.apk`. Android may ask you to allow installing
 apps from the browser or file manager used to open it.
 
 Version 2.0.1 moves matrix location, YUV colour sampling, demodulation and LDPC
 into a persistent background isolate. CameraPreview therefore remains responsive
 while the decoder is under full optical load.
+
+Version 2.0.2 rectifies the photographed four-corner perspective before sampling
+all 72 rows and learns the camera's actual dark/light level independently for
+each Color8 channel. This fixes barcode-only locks where every payload frame was
+previously rejected, and reports the real camera callback FPS while decoding.
 
 A new Flutter project.
 

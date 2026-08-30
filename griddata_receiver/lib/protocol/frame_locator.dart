@@ -31,11 +31,59 @@ class MatrixRect {
     required this.top,
     required this.width,
     required this.height,
+    this.topLeft,
+    this.topRight,
+    this.bottomRight,
+    this.bottomLeft,
   });
   final double left;
   final double top;
   final double width;
   final double height;
+  final math.Point<double>? topLeft;
+  final math.Point<double>? topRight;
+  final math.Point<double>? bottomRight;
+  final math.Point<double>? bottomLeft;
+
+  math.Point<double> _corner(math.Point<double>? value, double x, double y) =>
+      value ?? math.Point<double>(x, y);
+
+  /// Project a point from the data-cell unit square into the photographed
+  /// quadrilateral. This removes the row drift produced by a tilted tablet.
+  math.Point<double> mapData(double u, double v) {
+    const frameRatio = 0.07;
+    const inset = frameRatio / (1 + 2 * frameRatio);
+    final outerU = inset + u * (1 - 2 * inset);
+    final outerV = inset + v * (1 - 2 * inset);
+    final p0 = _corner(topLeft, left, top);
+    final p1 = _corner(topRight, left + width, top);
+    final p2 = _corner(bottomRight, left + width, top + height);
+    final p3 = _corner(bottomLeft, left, top + height);
+    final dx1 = p1.x - p2.x, dx2 = p3.x - p2.x;
+    final dy1 = p1.y - p2.y, dy2 = p3.y - p2.y;
+    final dx3 = p0.x - p1.x + p2.x - p3.x;
+    final dy3 = p0.y - p1.y + p2.y - p3.y;
+    var g = 0.0, h = 0.0;
+    final determinant = dx1 * dy2 - dx2 * dy1;
+    if ((dx3.abs() + dy3.abs()) > 1e-6 && determinant.abs() > 1e-6) {
+      g = (dx3 * dy2 - dx2 * dy3) / determinant;
+      h = (dx1 * dy3 - dx3 * dy1) / determinant;
+    }
+    final a = p1.x - p0.x + g * p1.x;
+    final b = p3.x - p0.x + h * p3.x;
+    final d = p1.y - p0.y + g * p1.y;
+    final e = p3.y - p0.y + h * p3.y;
+    final denominator = g * outerU + h * outerV + 1;
+    return math.Point<double>(
+      (a * outerU + b * outerV + p0.x) / denominator,
+      (d * outerU + e * outerV + p0.y) / denominator,
+    );
+  }
+
+  double dataCellSize(int gridWidth, int gridHeight) {
+    final a = mapData(0, 0), b = mapData(1, 0), c = mapData(0, 1);
+    return math.min(a.distanceTo(b) / gridWidth, a.distanceTo(c) / gridHeight);
+  }
 
   /// Strip away GridData's outer black finder ring, leaving data cells only.
   MatrixRect get dataRegion {
@@ -130,6 +178,9 @@ List<MatrixRect> locateOuterFrames(LumaPlane image, {int maxCount = 2}) {
     var maxX = 0;
     var minY = sampleHeight;
     var maxY = 0;
+    var minSum = double.infinity, maxSum = double.negativeInfinity;
+    var minDiff = double.infinity, maxDiff = double.negativeInfinity;
+    var tlX = 0, tlY = 0, trX = 0, trY = 0, brX = 0, brY = 0, blX = 0, blY = 0;
     while (read < write) {
       final point = queue[read++];
       final x = point % sampleWidth;
@@ -138,6 +189,28 @@ List<MatrixRect> locateOuterFrames(LumaPlane image, {int maxCount = 2}) {
       maxX = math.max(maxX, x);
       minY = math.min(minY, y);
       maxY = math.max(maxY, y);
+      final sum = (x + y).toDouble();
+      final diff = (x - y).toDouble();
+      if (sum < minSum) {
+        minSum = sum;
+        tlX = x;
+        tlY = y;
+      }
+      if (sum > maxSum) {
+        maxSum = sum;
+        brX = x;
+        brY = y;
+      }
+      if (diff > maxDiff) {
+        maxDiff = diff;
+        trX = x;
+        trY = y;
+      }
+      if (diff < minDiff) {
+        minDiff = diff;
+        blX = x;
+        blY = y;
+      }
       void add(int nx, int ny) {
         if (nx < 0 || ny < 0 || nx >= sampleWidth || ny >= sampleHeight) return;
         final next = ny * sampleWidth + nx;
@@ -167,6 +240,10 @@ List<MatrixRect> locateOuterFrames(LumaPlane image, {int maxCount = 2}) {
         top: minY * sy,
         width: width * sx,
         height: height * sy,
+        topLeft: math.Point<double>(tlX * sx, tlY * sy),
+        topRight: math.Point<double>(trX * sx, trY * sy),
+        bottomRight: math.Point<double>(brX * sx, brY * sy),
+        bottomLeft: math.Point<double>(blX * sx, blY * sy),
       ),
     ));
   }
@@ -211,18 +288,14 @@ List<double> sampleBarcodeLumaAtRow(
   int gridHeight,
   int row,
 ) {
-  final data = outer.dataRegion;
-  final cellWidth = data.width / gridWidth;
-  final cellHeight = data.height / gridHeight;
-  return List<double>.generate(
-    gridWidth,
-    (x) => _sampleWindow(
-      image,
-      data.left + (x + 0.5) * cellWidth,
-      data.top + (row + 0.5) * cellHeight,
-      math.min(cellWidth, cellHeight),
-    ),
-  );
+  final cellSize = outer.dataCellSize(gridWidth, gridHeight);
+  return List<double>.generate(gridWidth, (x) {
+    final point = outer.mapData(
+      (x + 0.5) / gridWidth,
+      (row + 0.5) / gridHeight,
+    );
+    return _sampleWindow(image, point.x, point.y, cellSize);
+  });
 }
 
 /// Samples the top barcode row after the frame has been located. [gridHeight]
@@ -234,18 +307,11 @@ List<double> sampleBarcodeLuma(
   int gridWidth,
   int gridHeight,
 ) {
-  final data = outer.dataRegion;
-  final cellWidth = data.width / gridWidth;
-  final cellHeight = data.height / gridHeight;
-  return List<double>.generate(
-    gridWidth,
-    (x) => _sampleWindow(
-      image,
-      data.left + (x + 0.5) * cellWidth,
-      data.top + cellHeight * 0.5,
-      math.min(cellWidth, cellHeight),
-    ),
-  );
+  final cellSize = outer.dataCellSize(gridWidth, gridHeight);
+  return List<double>.generate(gridWidth, (x) {
+    final point = outer.mapData((x + 0.5) / gridWidth, 0.5 / gridHeight);
+    return _sampleWindow(image, point.x, point.y, cellSize);
+  });
 }
 
 BarcodeData? locateBarcode(LumaPlane image, MatrixRect outer) {

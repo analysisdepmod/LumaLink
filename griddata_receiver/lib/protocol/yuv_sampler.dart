@@ -62,23 +62,21 @@ Color8Grid sampleColor8(
   MatrixRect outer,
   BarcodeData barcode,
 ) {
-  final data = outer.dataRegion;
   final cells = barcode.gridWidth * barcode.gridHeight;
   final red = Float32List(cells);
   final green = Float32List(cells);
   final blue = Float32List(cells);
   final reliability = Float32List(cells);
-  final cellWidth = data.width / barcode.gridWidth;
-  final cellHeight = data.height / barcode.gridHeight;
+  final cellSize = outer.dataCellSize(barcode.gridWidth, barcode.gridHeight);
   // Fast 64/72 profile: a bounded 3×3 centre sample avoids mixing neighbouring
   // colours and cuts YUV work sharply on mobile CPUs.
-  final radius = math
-      .min(1, math.max(0, math.min(cellWidth, cellHeight).floor() ~/ 4))
-      .toInt();
+  final radius = math.min(1, math.max(0, cellSize.floor() ~/ 4)).toInt();
   for (var gy = 0; gy < barcode.gridHeight; gy++) {
     for (var gx = 0; gx < barcode.gridWidth; gx++) {
-      final centreX = data.left + (gx + 0.5) * cellWidth;
-      final centreY = data.top + (gy + 0.5) * cellHeight;
+      final centre = outer.mapData(
+        (gx + 0.5) / barcode.gridWidth,
+        (gy + 0.5) / barcode.gridHeight,
+      );
       var sr = 0.0;
       var sg = 0.0;
       var sb = 0.0;
@@ -88,8 +86,8 @@ Color8Grid sampleColor8(
       for (var dy = -radius; dy <= radius; dy++) {
         for (var dx = -radius; dx <= radius; dx++) {
           final rgb = image.rgbAt(
-            (centreX + dx).round(),
-            (centreY + dy).round(),
+            (centre.x + dx).round(),
+            (centre.y + dy).round(),
           );
           sr += rgb.$1;
           sg += rgb.$2;
