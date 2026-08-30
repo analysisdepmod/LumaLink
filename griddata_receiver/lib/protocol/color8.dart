@@ -10,9 +10,13 @@ class Color8Grid {
     required this.green,
     required this.blue,
     Float32List? reliability,
-  }) : reliability = reliability ?? Float32List(gridWidth * gridHeight)..fillRange(0, gridWidth * gridHeight, 1) {
+  }) : reliability = reliability ?? Float32List(gridWidth * gridHeight)
+         ..fillRange(0, gridWidth * gridHeight, 1) {
     final cells = gridWidth * gridHeight;
-    if (red.length < cells || green.length < cells || blue.length < cells || this.reliability.length < cells) {
+    if (red.length < cells ||
+        green.length < cells ||
+        blue.length < cells ||
+        this.reliability.length < cells) {
       throw ArgumentError('Every channel must contain one sample per cell');
     }
   }
@@ -36,7 +40,9 @@ int bwCapacityBytes(int gridWidth, int gridHeight) =>
 double _llrFor(double channel, double reliability) {
   // 127.5 is the midpoint between GridData's 0 and 255 channel levels.
   // Keep the scale finite so an overexposed camera pixel cannot dominate LDPC.
-  final boundedReliability = reliability < 0 ? 0.0 : (reliability > 1 ? 1.0 : reliability);
+  final boundedReliability = reliability < 0
+      ? 0.0
+      : (reliability > 1 ? 1.0 : reliability);
   final llr = ((127.5 - channel) / 32) * boundedReliability;
   if (llr > 10) return 10;
   if (llr < -10) return -10;
@@ -50,7 +56,11 @@ Float64List softDemodulateColor8(Color8Grid grid) {
   final output = Float64List(capacity * 8);
   final firstDataCell = grid.gridWidth * barcodeRows;
   var out = 0;
-  for (var cell = firstDataCell; cell < grid.gridWidth * grid.gridHeight && out < output.length; cell++) {
+  for (
+    var cell = firstDataCell;
+    cell < grid.gridWidth * grid.gridHeight && out < output.length;
+    cell++
+  ) {
     final reliability = grid.reliability[cell];
     output[out++] = _llrFor(grid.red[cell], reliability);
     if (out >= output.length) break;
@@ -65,8 +75,15 @@ Float64List softDemodulateBw(Color8Grid grid) {
   final capacity = bwCapacityBytes(grid.gridWidth, grid.gridHeight);
   final output = Float64List(capacity * 8);
   var out = 0;
-  for (var cell = grid.gridWidth * barcodeRows; cell < grid.gridWidth * grid.gridHeight && out < output.length; cell++) {
-    final luminance = grid.red[cell] * 0.299 + grid.green[cell] * 0.587 + grid.blue[cell] * 0.114;
+  for (
+    var cell = grid.gridWidth * barcodeRows;
+    cell < grid.gridWidth * grid.gridHeight && out < output.length;
+    cell++
+  ) {
+    final luminance =
+        grid.red[cell] * 0.299 +
+        grid.green[cell] * 0.587 +
+        grid.blue[cell] * 0.114;
     output[out++] = _llrFor(luminance, grid.reliability[cell]);
   }
   return output;
@@ -76,23 +93,36 @@ Float64List softDemodulateBw(Color8Grid grid) {
 /// Color8 cells, retaining the barcode region for the caller to paint separately.
 Color8Grid encodeColor8Cells(Uint8List frame, int gridWidth, int gridHeight) {
   final capacity = color8CapacityBytes(gridWidth, gridHeight);
-  if (frame.length != capacity) throw ArgumentError('Frame does not match Color8 capacity');
+  if (frame.length != capacity)
+    throw ArgumentError('Frame does not match Color8 capacity');
   final cells = gridWidth * gridHeight;
   final red = Float32List(cells);
   final green = Float32List(cells);
   final blue = Float32List(cells);
   final reliability = Float32List(cells)..fillRange(0, cells, 1);
   var bit = 0;
-  for (var cell = gridWidth * barcodeRows; cell < cells && bit < frame.length * 8; cell++) {
+  for (
+    var cell = gridWidth * barcodeRows;
+    cell < cells && bit < frame.length * 8;
+    cell++
+  ) {
     double readBit() {
       if (bit >= frame.length * 8) return 0.0;
       final value = (frame[bit ~/ 8] >> (7 - (bit % 8))) & 1;
       bit++;
       return value == 1 ? 255.0 : 0.0;
     }
+
     red[cell] = readBit();
     green[cell] = readBit();
     blue[cell] = readBit();
   }
-  return Color8Grid(gridWidth: gridWidth, gridHeight: gridHeight, red: red, green: green, blue: blue, reliability: reliability);
+  return Color8Grid(
+    gridWidth: gridWidth,
+    gridHeight: gridHeight,
+    red: red,
+    green: green,
+    blue: blue,
+    reliability: reliability,
+  );
 }

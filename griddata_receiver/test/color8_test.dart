@@ -13,7 +13,11 @@ void main() {
     final packed = encodeFrame(sent, color8CapacityBytes(width, height), 0.6);
     final grid = encodeColor8Cells(packed, width, height);
 
-    final decoded = decodeFrameLlr(softDemodulateColor8(grid), packed.length, 0.6);
+    final decoded = decodeFrameLlr(
+      softDemodulateColor8(grid),
+      packed.length,
+      0.6,
+    );
 
     expect(decoded, isNotNull);
     expect(decoded!.type, frameData);

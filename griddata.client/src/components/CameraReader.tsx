@@ -3,7 +3,8 @@ import { Tag, Button } from 'antd'
 import { CameraOutlined, SwapOutlined, ReloadOutlined, BulbOutlined, AimOutlined } from '@ant-design/icons'
 import { type EncodingSpec } from '../services/visualCodec'
 import { FRAME_TYPE_DATA, type ParsedFrame, type TransferManifest } from '../services/transferCodec'
-import type { DecodeReply, NormQuad, WebGpuStatus } from '../services/decodeWorker'
+import { TIMING_STATE_WORDS } from '../services/timingClaims'
+import type { DecodeReply, NormQuad, TrackHint, WebGpuStatus } from '../services/decodeWorker'
 
 interface Props {
     spec?: EncodingSpec   // manual/locked spec; omit when auto === true
@@ -229,7 +230,7 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
         const workers: Worker[] = []
         const busy: boolean[] = []
         const sharedTimingTicks = globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined'
-            ? new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2))
+            ? new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * TIMING_STATE_WORDS))
             : null
         sharedTimingTicks?.fill(-1)
         // Turbo lanes are independent optical views. Keep a worker sticky to a
@@ -254,6 +255,11 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
         let decodeEwma = 0
         let slowSamples = 0
         let fastSamples = 0
+        let payloadQualitySamples = 0
+        let payloadSuccessEwma = 0
+        let ultraCleanMode = false
+        let ultraCleanSamples = 0
+        let ultraWeakSamples = 0
         let gpuCapture = false
         let webGpuEver = false
         let webGpuStatus: WebGpuStatus = 'waiting'
@@ -268,6 +274,8 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
         const recentSeedQueue: number[] = []
         const lastSuccessfulTimingTick: [number | null, number | null] = [null, null]
         const lastObservedTimingTick: [number | null, number | null] = [null, null]
+        const laneTrackHints: [TrackHint | null, TrackHint | null] = [null, null]
+        const laneTrackHintAt: [number, number] = [0, 0]
         let detectedSenderFps = 0
         let timingSkips = 0
         let duplicatePressure = 0
@@ -298,6 +306,13 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
             if (!e.data.duplicateFrame)
                 decodeEwma = decodeEwma === 0 ? e.data.ms : decodeEwma * 0.82 + e.data.ms * 0.18
             const { result, found, lockedSpec } = e.data
+            if (!e.data.duplicateFrame && manifestRef.current) {
+                const success = result ? 1 : 0
+                payloadSuccessEwma = payloadQualitySamples === 0
+                    ? success
+                    : payloadSuccessEwma * 0.88 + success * 0.12
+                payloadQualitySamples++
+            }
             const activeTransferId = manifestRef.current?.id ?? null
             if (activeTransferId !== phaseTransferId) {
                 phaseTransferId = activeTransferId
@@ -306,12 +321,22 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                 recentSeedQueue.length = 0
                 lastSuccessfulTimingTick[0] = lastSuccessfulTimingTick[1] = null
                 lastObservedTimingTick[0] = lastObservedTimingTick[1] = null
+                laneTrackHints[0] = laneTrackHints[1] = null
+                laneTrackHintAt[0] = laneTrackHintAt[1] = 0
                 sharedTimingTicks?.fill(-1)
                 duplicatePressure = 0
+                ultraCleanMode = false
+                ultraCleanSamples = 0
+                ultraWeakSamples = 0
             }
             if (e.data.senderFps && e.data.senderFps >= 1 && e.data.senderFps <= 120)
                 detectedSenderFps = e.data.senderFps
             const timingLane = e.data.timingLane
+            const trackLane = timingLane === 0 || timingLane === 1 ? timingLane : repliedLane
+            if ((trackLane === 0 || trackLane === 1) && e.data.trackHint) {
+                laneTrackHints[trackLane] = e.data.trackHint
+                laneTrackHintAt[trackLane] = performance.now()
+            }
             if (timingLane === 0 || timingLane === 1) {
                 const repeatedTick = lastObservedTimingTick[timingLane] === e.data.timingTick
                 lastObservedTimingTick[timingLane] = e.data.timingTick ?? lastObservedTimingTick[timingLane]
@@ -395,17 +420,74 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                     Math.round(Math.max(activeManifest.gridW, activeManifest.gridH) * 15)))
             }
             const isTunedColor8 = isAuto && activeManifest?.enc === 'color8'
-                && activeManifest.gridW <= 64 && activeManifest.gridH <= 64
+                && activeManifest.gridW <= 72 && activeManifest.gridH <= 72
             if (isTunedColor8 && processed >= 10) {
-                if (decodeEwma > 235) { slowSamples++; fastSamples = 0 }
-                else if (decodeEwma < 180) { fastSamples++; slowSamples = 0 }
-                else { slowSamples = 0; fastSamples = 0 }
-                if (slowSamples >= 8 && procRef.current > 900) {
-                    procRef.current = Math.max(900, procRef.current - 30)
-                    slowSamples = 0
-                } else if (fastSamples >= 14 && procRef.current < 960) {
-                    procRef.current = Math.min(960, procRef.current + 30)
-                    fastSamples = 0
+                const fast72 = activeManifest!.gridW > 64 || activeManifest!.gridH > 64
+                const normalProc = fast72 ? 1008 : 960
+                if (fast72) {
+                    // Density is useful only while the optical margin remains clean.
+                    // Walk down to 900px after several strong payload decodes. On an
+                    // exceptionally clean, almost-fully-tracked link, continue to a
+                    // guarded 810px floor; hysteresis restores 900–1008px before a
+                    // short optical wobble can become sticky.
+                    const qualityGood = (e.data.colorConfidence ?? 0) >= 0.80
+                        && (e.data.spatialBlur ?? 1) <= 0.06
+                        && payloadQualitySamples >= 8 && payloadSuccessEwma >= 0.78
+                    const standardWeak = payloadQualitySamples >= 4
+                        && ((e.data.colorConfidence ?? 0) < 0.76
+                            || (e.data.spatialBlur ?? 0) > 0.085
+                            || payloadSuccessEwma < 0.68)
+                    const trackRatio = processed > 0 ? trackedFrames / processed : 0
+                    const ultraCandidate = payloadQualitySamples >= 12
+                        && trackRatio >= 0.85
+                        && (e.data.colorConfidence ?? 0) >= 0.93
+                        && (e.data.spatialBlur ?? 1) <= 0.03
+                        && payloadSuccessEwma >= 0.82
+                    const ultraHealthy = trackRatio >= 0.72
+                        && (e.data.colorConfidence ?? 0) >= 0.86
+                        && (e.data.spatialBlur ?? 1) <= 0.06
+                        && payloadSuccessEwma >= 0.74
+                    if (ultraCandidate) {
+                        ultraCleanSamples = Math.min(16, ultraCleanSamples + 1)
+                        ultraWeakSamples = 0
+                    } else if (!ultraHealthy) {
+                        ultraWeakSamples++
+                        ultraCleanSamples = Math.max(0, ultraCleanSamples - 3)
+                    } else {
+                        // A merely good exposure is not evidence against the clean
+                        // link; decay one point instead of erasing the whole history.
+                        ultraCleanSamples = Math.max(0, ultraCleanSamples - 1)
+                        ultraWeakSamples = 0
+                    }
+                    if (!ultraCleanMode && ultraCleanSamples >= 8) {
+                        ultraCleanMode = true; ultraCleanSamples = 0
+                    } else if (ultraCleanMode && ultraWeakSamples >= 4) {
+                        ultraCleanMode = false; ultraWeakSamples = 0
+                    }
+                    const minProc = ultraCleanMode ? 810 : 900
+                    const needsDetail = standardWeak || (!ultraCleanMode && procRef.current < 900)
+                    if (needsDetail) { fastSamples++; slowSamples = 0 }
+                    else if (decodeEwma > 175 && qualityGood) { slowSamples++; fastSamples = 0 }
+                    else { slowSamples = 0; fastSamples = 0 }
+                    if (slowSamples >= 5 && procRef.current > minProc) {
+                        procRef.current = Math.max(minProc, procRef.current - 36)
+                        slowSamples = 0
+                    } else if (fastSamples >= 3 && procRef.current < normalProc) {
+                        procRef.current = Math.min(normalProc, procRef.current + 54)
+                        fastSamples = 0
+                    }
+                } else {
+                    const minProc = 900
+                    if (decodeEwma > 235) { slowSamples++; fastSamples = 0 }
+                    else if (decodeEwma < 180) { fastSamples++; slowSamples = 0 }
+                    else { slowSamples = 0; fastSamples = 0 }
+                    if (slowSamples >= 8 && procRef.current > minProc) {
+                        procRef.current = Math.max(minProc, procRef.current - 30)
+                        slowSamples = 0
+                    } else if (fastSamples >= 14 && procRef.current < normalProc) {
+                        procRef.current = Math.min(normalProc, procRef.current + 30)
+                        fastSamples = 0
+                    }
                 }
             }
             onStatsRef.current?.({
@@ -570,15 +652,18 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                     busy[wi] = true
                     if (laneCount === 2) workerLane[wi] = lane
                     const rid = reqId++
+                    const trackHint = performance.now() - laneTrackHintAt[lane] <= 750
+                        ? laneTrackHints[lane] ?? undefined
+                        : undefined
                     if (useBitmap) {
                         createImageBitmap(video, sx, sy, cropW, cropH, { resizeWidth: procW, resizeHeight: procH, resizeQuality })
-                            .then(bmp => { if (cancelled) { bmp.close(); return } workers[wi].postMessage({ bitmap: bmp, w: procW, h: procH, auto: isAuto, spec, manifest: manifestRef.current ?? undefined, lastTimingTick: lastSuccessfulTimingTick[lane] ?? undefined, expectedLane: lane, timingState: sharedTimingTicks?.buffer as SharedArrayBuffer | undefined, id: rid }, [bmp]) })
+                            .then(bmp => { if (cancelled) { bmp.close(); return } workers[wi].postMessage({ bitmap: bmp, w: procW, h: procH, auto: isAuto, spec, manifest: manifestRef.current ?? undefined, lastTimingTick: lastSuccessfulTimingTick[lane] ?? undefined, expectedLane: lane, timingState: sharedTimingTicks?.buffer as SharedArrayBuffer | undefined, trackHint, id: rid }, [bmp]) })
                             .catch(() => { busy[wi] = false })
                     } else {
                         canvas.width = procW; canvas.height = procH
                         ctx.drawImage(video, sx, sy, cropW, cropH, 0, 0, procW, procH)
                         const img = ctx.getImageData(0, 0, procW, procH)
-                        workers[wi].postMessage({ pixels: img.data.buffer, w: procW, h: procH, auto: isAuto, spec, manifest: manifestRef.current ?? undefined, lastTimingTick: lastSuccessfulTimingTick[lane] ?? undefined, expectedLane: lane, timingState: sharedTimingTicks?.buffer as SharedArrayBuffer | undefined, id: rid }, [img.data.buffer])
+                        workers[wi].postMessage({ pixels: img.data.buffer, w: procW, h: procH, auto: isAuto, spec, manifest: manifestRef.current ?? undefined, lastTimingTick: lastSuccessfulTimingTick[lane] ?? undefined, expectedLane: lane, timingState: sharedTimingTicks?.buffer as SharedArrayBuffer | undefined, trackHint, id: rid }, [img.data.buffer])
                     }
                 }
                 type VideoFrameCapable = HTMLVideoElement & {

@@ -26,7 +26,12 @@ class LumaPlane {
 }
 
 class MatrixRect {
-  const MatrixRect({required this.left, required this.top, required this.width, required this.height});
+  const MatrixRect({
+    required this.left,
+    required this.top,
+    required this.width,
+    required this.height,
+  });
   final double left;
   final double top;
   final double width;
@@ -64,7 +69,11 @@ int _otsu(List<int> values) {
     backgroundSum += threshold * histogram[threshold];
     final backgroundMean = backgroundSum / backgroundCount;
     final foregroundMean = (sum - backgroundSum) / foregroundCount;
-    final variance = (backgroundCount * foregroundCount * math.pow(backgroundMean - foregroundMean, 2)).toDouble();
+    final variance =
+        (backgroundCount *
+                foregroundCount *
+                math.pow(backgroundMean - foregroundMean, 2))
+            .toDouble();
     if (variance > bestVariance) {
       bestVariance = variance;
       bestThreshold = threshold;
@@ -77,9 +86,21 @@ int _otsu(List<int> values) {
 /// deliberately coarse: the app re-runs it each frame, so it self-corrects if
 /// the phone moves. Sampling is centred inside every data cell afterwards.
 MatrixRect? locateOuterFrame(LumaPlane image) {
+  final frames = locateOuterFrames(image, maxCount: 1);
+  return frames.isEmpty ? null : frames.first;
+}
+
+/// Returns both independently displayed Turbo tiles from one camera exposure.
+/// Candidates are scored before being sorted spatially, so a noisy dark patch
+/// cannot displace a valid second matrix merely because it appears first.
+List<MatrixRect> locateOuterFrames(LumaPlane image, {int maxCount = 2}) {
   const longest = 160;
-  final sampleWidth = image.width >= image.height ? longest : math.max(1, (longest * image.width / image.height).round());
-  final sampleHeight = image.height > image.width ? longest : math.max(1, (longest * image.height / image.width).round());
+  final sampleWidth = image.width >= image.height
+      ? longest
+      : math.max(1, (longest * image.width / image.height).round());
+  final sampleHeight = image.height > image.width
+      ? longest
+      : math.max(1, (longest * image.height / image.width).round());
   final sx = image.width / sampleWidth;
   final sy = image.height / sampleHeight;
   final luma = List<int>.filled(sampleWidth * sampleHeight, 0);
@@ -98,8 +119,7 @@ MatrixRect? locateOuterFrame(LumaPlane image) {
   }
   final visited = Uint8List(luma.length);
   final queue = Int32List(luma.length);
-  var bestScore = 0.0;
-  MatrixRect? best;
+  final candidates = <(double, MatrixRect)>[];
   for (var start = 0; start < dark.length; start++) {
     if (dark[start] == 0 || visited[start] != 0) continue;
     var read = 0;
@@ -138,17 +158,26 @@ MatrixRect? locateOuterFrame(LumaPlane image) {
     final ratio = width / height;
     if (ratio < 0.45 || ratio > 2.2) continue;
     final fill = write / (width * height);
-    final score = (write * math.min(width, height) * (fill < 0.02 ? 0.1 : 1)).toDouble();
-    if (score > bestScore) {
-      bestScore = score;
-      best = MatrixRect(left: minX * sx, top: minY * sy, width: width * sx, height: height * sy);
-    }
+    final score = (write * math.min(width, height) * (fill < 0.02 ? 0.1 : 1))
+        .toDouble();
+    candidates.add((
+      score,
+      MatrixRect(
+        left: minX * sx,
+        top: minY * sy,
+        width: width * sx,
+        height: height * sy,
+      ),
+    ));
   }
-  return best;
+  candidates.sort((a, b) => b.$1.compareTo(a.$1));
+  final selected = candidates.take(maxCount).map((value) => value.$2).toList();
+  selected.sort((a, b) => a.left.compareTo(b.left));
+  return selected;
 }
 
 double _sampleWindow(LumaPlane image, double x, double y, double cellSize) {
-  final radius = math.max(0, (cellSize / 4).floor());
+  final radius = math.min(1, math.max(0, (cellSize / 4).floor()));
   var total = 0.0;
   var count = 0;
   for (var dy = -radius; dy <= radius; dy++) {
@@ -160,21 +189,77 @@ double _sampleWindow(LumaPlane image, double x, double y, double cellSize) {
   return count == 0 ? 0 : total / count;
 }
 
-/// Samples the top barcode row after the frame has been located. [gridHeight]
-/// only needs to be a geometry estimate because the barcode itself returns the
-/// exact height; this mirrors the inexpensive browser lock-on path.
-List<double> sampleBarcodeLuma(LumaPlane image, MatrixRect outer, int gridWidth, int gridHeight) {
+TimingBarcodeData? locateTimingBarcode(
+  LumaPlane image,
+  MatrixRect outer,
+  BarcodeData barcode,
+) {
+  final row = sampleBarcodeLumaAtRow(
+    image,
+    outer,
+    barcode.gridWidth,
+    barcode.gridHeight,
+    2,
+  );
+  return decodeTimingBarcodeLuminance(row);
+}
+
+List<double> sampleBarcodeLumaAtRow(
+  LumaPlane image,
+  MatrixRect outer,
+  int gridWidth,
+  int gridHeight,
+  int row,
+) {
   final data = outer.dataRegion;
   final cellWidth = data.width / gridWidth;
   final cellHeight = data.height / gridHeight;
-  return List<double>.generate(gridWidth, (x) => _sampleWindow(image, data.left + (x + 0.5) * cellWidth, data.top + cellHeight * 0.5, math.min(cellWidth, cellHeight)));
+  return List<double>.generate(
+    gridWidth,
+    (x) => _sampleWindow(
+      image,
+      data.left + (x + 0.5) * cellWidth,
+      data.top + (row + 0.5) * cellHeight,
+      math.min(cellWidth, cellHeight),
+    ),
+  );
+}
+
+/// Samples the top barcode row after the frame has been located. [gridHeight]
+/// only needs to be a geometry estimate because the barcode itself returns the
+/// exact height; this mirrors the inexpensive browser lock-on path.
+List<double> sampleBarcodeLuma(
+  LumaPlane image,
+  MatrixRect outer,
+  int gridWidth,
+  int gridHeight,
+) {
+  final data = outer.dataRegion;
+  final cellWidth = data.width / gridWidth;
+  final cellHeight = data.height / gridHeight;
+  return List<double>.generate(
+    gridWidth,
+    (x) => _sampleWindow(
+      image,
+      data.left + (x + 0.5) * cellWidth,
+      data.top + cellHeight * 0.5,
+      math.min(cellWidth, cellHeight),
+    ),
+  );
 }
 
 BarcodeData? locateBarcode(LumaPlane image, MatrixRect outer) {
   for (var width = 40; width <= 256; width += 8) {
-    final approximateHeight = math.max(barcodeRows + 1, (outer.height / outer.width * width).round());
-    final decoded = decodeBarcodeLuminance(sampleBarcodeLuma(image, outer, width, approximateHeight));
-    if (decoded != null && decoded.version == barcodeVersion && (decoded.gridWidth == 0 || decoded.gridWidth == width)) {
+    final approximateHeight = math.max(
+      barcodeRows + 1,
+      (outer.height / outer.width * width).round(),
+    );
+    final decoded = decodeBarcodeLuminance(
+      sampleBarcodeLuma(image, outer, width, approximateHeight),
+    );
+    if (decoded != null &&
+        decoded.version == barcodeVersion &&
+        (decoded.gridWidth == 0 || decoded.gridWidth == width)) {
       return decoded;
     }
   }

@@ -14,7 +14,14 @@ void main() {
         pixels[y * width + x] = border ? 8 : 150;
       }
     }
-    final actual = locateOuterFrame(LumaPlane(width: width, height: height, bytes: pixels, bytesPerRow: width));
+    final actual = locateOuterFrame(
+      LumaPlane(
+        width: width,
+        height: height,
+        bytes: pixels,
+        bytesPerRow: width,
+      ),
+    );
 
     expect(actual, isNotNull);
     expect(actual!.left, closeTo(80, 8));

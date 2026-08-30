@@ -460,8 +460,8 @@ function refineWithFinders(px: Uint8ClampedArray, w: number, h: number, rq: Quad
 }
 
 /** Sample every cell of a `gridW`×`gridH` grid through a located map. */
-export function sampleMapped(px: Uint8ClampedArray, w: number, h: number, map: GridMap, gridW: number, gridH: number): CellReadings {
-  return sampleHomography(px, w, h, map, gridW, gridH)
+export function sampleMapped(px: Uint8ClampedArray, w: number, h: number, map: GridMap, gridW: number, gridH: number, maxWindow = 2): CellReadings {
+  return sampleHomography(px, w, h, map, gridW, gridH, maxWindow)
 }
 
 /**
@@ -732,6 +732,7 @@ function homographyUnitSquareToQuad(p0: Pt, p1: Pt, p2: Pt, p3: Pt): (u: number,
 function sampleHomography(
   px: Uint8ClampedArray, w: number, h: number,
   map: (u: number, v: number) => Pt, gridW: number, gridH: number,
+  maxWindow = 2,
 ): CellReadings {
   const n = gridW * gridH
   const scratch = colorSamplingScratch(n)
@@ -745,7 +746,7 @@ function sampleHomography(
   // a photographed 64² Color8 cell. The former unbounded 7×7/9×9 window
   // nearly doubled sampling work and increasingly mixed neighbour symbols as the
   // matrix moved closer to the camera. Dense grids naturally select a smaller win.
-  const win = Math.min(2, Math.max(0, Math.floor(cellPx / 4)))
+  const win = Math.min(maxWindow, Math.max(0, Math.floor(cellPx / 4)))
   // A crisp, well-focused cell reads nearly UNIFORM inside its sampling window;
   // a blurred cell — or one straddling a neighbour because registration drifted —
   // reads with high internal luminance variance. We turn that variance into an

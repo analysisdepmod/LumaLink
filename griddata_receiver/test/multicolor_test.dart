@@ -29,7 +29,14 @@ void main() {
     red[anchor] = 255;
     green[anchor] = 255;
     blue[anchor] = 0;
-    final grid = Color8Grid(gridWidth: width, gridHeight: height, red: red, green: green, blue: blue, reliability: reliability);
+    final grid = Color8Grid(
+      gridWidth: width,
+      gridHeight: height,
+      red: red,
+      green: green,
+      blue: blue,
+      reliability: reliability,
+    );
 
     final llr = softDemodulateMultiColor(grid, GridEncoding.color16);
 

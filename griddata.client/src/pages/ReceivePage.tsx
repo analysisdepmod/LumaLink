@@ -125,6 +125,8 @@ export default function ReceivePage() {
       chunkBytes: manifest.chunk,
       ldpcRate: manifest.rate,
       senderFps: manifest.fps,
+      gridW: manifest.gridW,
+      gridH: manifest.gridH,
       lanes: tileCountRef.current,
       colorConfidence: statsRef.current.colorConfidence,
     }) : null

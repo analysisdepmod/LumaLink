@@ -51,7 +51,9 @@ LdpcCode makeLdpcKm(int k, int m, {int degree = 3}) {
   }
   final checks = List<List<int>>.generate(m, (_) => <int>[]);
   final messages = List<List<int>>.generate(k, (_) => <int>[]);
-  final random = _Mulberry32(_u32((k * 2654435761) ^ (m * 40503) ^ (degree * 668265263)));
+  final random = _Mulberry32(
+    _u32((k * 2654435761) ^ (m * 40503) ^ (degree * 668265263)),
+  );
   for (var bit = 0; bit < k; bit++) {
     final used = <int>{};
     for (var edge = 0; edge < degree; edge++) {
@@ -87,7 +89,8 @@ Uint8List encodeParity(LdpcCode code, Uint8List message) {
 /// Sum-product belief propagation. Positive LLR means the optical channel
 /// favours a zero bit, exactly as in the browser implementation.
 Uint8List decode(LdpcCode code, Float64List llr, {int iterations = 24}) {
-  if (llr.length < code.n) throw ArgumentError('LLR vector is shorter than codeword');
+  if (llr.length < code.n)
+    throw ArgumentError('LLR vector is shorter than codeword');
   final checkVars = List<List<int>>.generate(code.m, (check) {
     final row = <int>[...code.checkMessages[check], code.k + check];
     if (check > 0) row.add(code.k + check - 1);
@@ -99,8 +102,14 @@ Uint8List decode(LdpcCode code, Float64List llr, {int iterations = 24}) {
       degrees[variable]++;
     }
   }
-  final variableChecks = List<List<int>>.generate(code.n, (i) => List<int>.filled(degrees[i], 0));
-  final variablePositions = List<List<int>>.generate(code.n, (i) => List<int>.filled(degrees[i], 0));
+  final variableChecks = List<List<int>>.generate(
+    code.n,
+    (i) => List<int>.filled(degrees[i], 0),
+  );
+  final variablePositions = List<List<int>>.generate(
+    code.n,
+    (i) => List<int>.filled(degrees[i], 0),
+  );
   final fills = Int32List(code.n);
   for (var check = 0; check < checkVars.length; check++) {
     final row = checkVars[check];

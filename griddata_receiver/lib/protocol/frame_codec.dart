@@ -9,7 +9,11 @@ const int frameData = 1;
 const int frameSolo = 2;
 
 class DecodedFrame {
-  const DecodedFrame({required this.type, required this.seed, required this.payload});
+  const DecodedFrame({
+    required this.type,
+    required this.seed,
+    required this.payload,
+  });
   final int type;
   final int seed;
   final Uint8List payload;
@@ -89,26 +93,34 @@ Uint8List _bytesToBits(Uint8List bytes) {
 
 int messageBytesFor(int capacity, double rate) =>
     (capacity * rate).floor() < frameHeaderBytes + frameCrcBytes + 1
-        ? frameHeaderBytes + frameCrcBytes + 1
-        : (capacity * rate).floor();
+    ? frameHeaderBytes + frameCrcBytes + 1
+    : (capacity * rate).floor();
 
 DecodedFrame? _parseMessage(Uint8List message) {
   if (message.length < frameHeaderBytes + frameCrcBytes) return null;
   final crcOffset = message.length - frameCrcBytes;
   final view = ByteData.sublistView(message);
-  if (view.getUint32(crcOffset, Endian.little) != crc32(message, 0, crcOffset)) return null;
+  if (view.getUint32(crcOffset, Endian.little) != crc32(message, 0, crcOffset))
+    return null;
   final length = view.getUint32(5, Endian.little);
   if (length > crcOffset - frameHeaderBytes) return null;
   return DecodedFrame(
     type: message[0],
     seed: view.getUint32(1, Endian.little),
-    payload: Uint8List.fromList(message.sublist(frameHeaderBytes, frameHeaderBytes + length)),
+    payload: Uint8List.fromList(
+      message.sublist(frameHeaderBytes, frameHeaderBytes + length),
+    ),
   );
 }
 
 /// Decodes a soft-demodulated optical frame. Input LLR order is the transmitted
 /// cell-bit order; positive values mean a camera reading favours zero.
-DecodedFrame? decodeFrameLlr(Float64List transmittedLlr, int capacity, double rate, {int iterations = 24}) {
+DecodedFrame? decodeFrameLlr(
+  Float64List transmittedLlr,
+  int capacity,
+  double rate, {
+  int iterations = 24,
+}) {
   if (capacity < 1 || transmittedLlr.length < capacity * 8) return null;
   final messageBytes = messageBytesFor(capacity, rate);
   final code = makeLdpcKm(messageBytes * 8, capacity * 8 - messageBytes * 8);
@@ -148,7 +160,11 @@ Uint8List encodeFrame(DecodedFrame frame, int capacity, double rate) {
   message[0] = frame.type;
   view.setUint32(1, frame.seed, Endian.little);
   view.setUint32(5, frame.payload.length, Endian.little);
-  message.setRange(frameHeaderBytes, frameHeaderBytes + frame.payload.length, frame.payload);
+  message.setRange(
+    frameHeaderBytes,
+    frameHeaderBytes + frame.payload.length,
+    frame.payload,
+  );
   view.setUint32(crcOffset, crc32(message, 0, crcOffset), Endian.little);
   final code = makeLdpcKm(messageBytes * 8, capacity * 8 - messageBytes * 8);
   final messageBits = _bytesToBits(message);

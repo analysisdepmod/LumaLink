@@ -1,4 +1,13 @@
-# griddata_receiver
+# LumaLink Receiver for Android
+
+Native Android camera receiver for the LumaLink optical channel. Version 2 is
+compatible with protocol v9, Color8 64/72, Turbo ×2, sender timing barcodes,
+compact manifests, SHA-256 verification, and the bounded 128-chunk Fountain
+tail solver.
+
+The ready-to-install APK is published at
+`releases/LumaLink-Receiver-v2.0.0.apk`. Android may ask you to allow installing
+apps from the browser or file manager used to open it.
 
 A new Flutter project.
 

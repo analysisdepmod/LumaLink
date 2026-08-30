@@ -6,7 +6,9 @@ import 'package:griddata_receiver/protocol/ldpc.dart';
 void main() {
   test('corrects a handful of hard optical bit errors', () {
     final code = makeLdpcKm(96, 64);
-    final message = Uint8List.fromList(List<int>.generate(96, (i) => (i * 13 + 7) & 1));
+    final message = Uint8List.fromList(
+      List<int>.generate(96, (i) => (i * 13 + 7) & 1),
+    );
     final parity = encodeParity(code, message);
     final llr = Float64List(code.n);
     for (var i = 0; i < code.k; i++) {

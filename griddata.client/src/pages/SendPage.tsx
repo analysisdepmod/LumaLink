@@ -18,7 +18,7 @@ const ENCODING_STEPS: { value: Encoding; label: string; detail: string }[] = [
   { value: 'color32', label: '32 لون', detail: 'كاميرا ممتازة' },
   { value: 'color64', label: '64 لون', detail: 'تجريبي' },
 ]
-const GRID_STEPS = [64, 96, 128, 192, 256]
+const GRID_STEPS = [64, 72, 96, 128, 192, 256]
 const SPEED_STEPS = [2, 4, 5, 6.5, 8, 10, 12, 15, 20, 30, 45, 60, 80, 100]
 const PROTECTION_STEPS = [0.5, 0.6, 0.625, 0.7]
 const PROTECTION_LABEL: Record<number, { title: string; detail: string }> = {
@@ -30,7 +30,7 @@ const PROTECTION_LABEL: Record<number, { title: string; detail: string }> = {
 type ProfileKey = 'stable' | 'fast' | 'lab'
 const PROFILES: Record<ProfileKey, { label: string; caption: string; enc: Encoding; grid: number; fps: number; rate: number; lanes: 1 | 2 }> = {
   stable: { label: 'مستقر', caption: 'للروابط اليومية', enc: 'color8', grid: 64, fps: 6.5, rate: 0.625, lanes: 1 },
-  fast: { label: 'Fast', caption: 'تلقائي حسب قوة الاستقبال', enc: 'color8', grid: 64, fps: 12, rate: 0.625, lanes: 2 },
+  fast: { label: 'Fast', caption: 'سعة أعلى للوصلة النظيفة', enc: 'color8', grid: 72, fps: 12, rate: 0.625, lanes: 2 },
   lab: { label: 'دقة عالية', caption: 'شاشة وكاميرا أقوى', enc: 'color16', grid: 128, fps: 5, rate: 0.5, lanes: 1 },
 }
 

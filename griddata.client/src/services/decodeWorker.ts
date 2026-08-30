@@ -20,6 +20,7 @@ import { loadLdpcWasm } from './ldpcWasm'
 import { loadSpatialSimd } from './spatialSimdWasm'
 import { BARCODE_VERSION, BARCODE_ROWS, METADATA_BARCODE_ROWS, TIMING_BARCODE_ROW, decodeBarcodeRow, decodeTimingBarcodeRow } from './metaBarcode'
 import { WebGpuGridSampler } from './webGpuGridSampler'
+import { claimTimingTick, finishTimingClaim, TIMING_DUPLICATE, TIMING_UNCLAIMED } from './timingClaims'
 
 let wasmActive = false
 let spatialSimdActive = false
@@ -57,6 +58,8 @@ interface DecodeRequest {
   expectedLane?: 0 | 1
   /** Atomic successful-tick table shared by every decoder worker when isolated. */
   timingState?: SharedArrayBuffer
+  /** Recent successful finder fit from the other worker assigned to this lane. */
+  trackHint?: TrackHint
   id: number
 }
 export type WebGpuStatus = 'waiting' | 'probing' | 'active' | 'unavailable' | 'rejected'
@@ -102,11 +105,14 @@ export interface DecodeReply {
   // processed frame (x/w, y/h). Present whenever a matrix was found this frame so
   // the UI can draw tracking brackets that hug the tile. Undefined ⇒ nothing seen.
   quad?: NormQuad
+  /** Normalised finder fit safe to share with another worker on the same lane. */
+  trackHint?: TrackHint
 }
 
 /** A quad with each corner normalised to [0,1] of the frame it was found in. */
 export interface NormQuad { tl: Pt; tr: Pt; br: Pt; bl: Pt }
 interface Pt { x: number; y: number }
+export interface TrackHint { centers: [Pt, Pt, Pt, Pt]; ms: number; t: number }
 
 // Candidate gridW values for barcode-first detection. The sender derives its grid
 // from its own screen (any multiple of 8), so the receiver cannot assume a fixed
@@ -256,6 +262,10 @@ let curSenderFps: number | undefined
 let curTimingTick: number | undefined
 let curTimingLane: 0 | 1 | undefined
 let curDuplicateFrame = false
+let curTimingClaimSlot = TIMING_UNCLAIMED
+let curTimingSharedState: Int32Array | null = null
+let curFrameW = 1
+let curFrameH = 1
 
 // A single fountain frame is intentionally noise-like, therefore its neighbour
 // correlation is a useful instantaneous MTF/blur observation.  Smooth it across
@@ -316,8 +326,9 @@ function superFor(spec: EncodingSpec): SuperReceiver | null {
   return superRx
 }
 self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
-  const { pixels, bitmap, w, h, auto, spec, manifest, reset, lastTimingTick, expectedLane, timingState, id } = e.data
+  const { pixels, bitmap, w, h, auto, spec, manifest, reset, lastTimingTick, expectedLane, timingState, trackHint, id } = e.data
   t0 = performance.now()
+  curFrameW = Math.max(1, w); curFrameH = Math.max(1, h)
   curQuad = undefined
   curTracked = false
   curPhase = 'search'
@@ -329,6 +340,8 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
   curTimingTick = undefined
   curTimingLane = undefined
   curDuplicateFrame = false
+  curTimingClaimSlot = TIMING_UNCLAIMED
+  curTimingSharedState = timingState ? new Int32Array(timingState) : null
   try {
     if (reset) { locked = null; lockedZm = null; lockedTransferId = null; rx = null; superRx = null; superKey = ''; superFusedLooks = 0; superWins = 0; resetSpatialCalibration(); resetGpuValidation(); fCursor = 0; pendingKey = ''; pendingCount = 0; sinceProgress = 0; barcodeSeen = false; trackState = null; trackVelocity = null; heldMapFrames = 0; trackingReady = false; trackingGood = 0; trackedFailures = 0 }
     // Once any worker has decoded the manifest, CameraReader forwards it to the
@@ -405,7 +418,18 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
     const predictedTrack = USE_TRACKED_PREDICTION && trackingReady && trackState
       ? { ...trackState, centers: trackState.centers.map((p, i) => ({ x: p.x + (trackVelocity?.[i]?.x ?? 0), y: p.y + (trackVelocity?.[i]?.y ?? 0) })) as TrackState['centers'] }
       : null
-    let located = predictedTrack ? locateMatrixTracked(px, w, h, predictedTrack) : null
+    // The second worker on a Turbo lane otherwise spends eight successful frames
+    // building a duplicate private tracker. A normalised hint survives adaptive
+    // resolution changes; locateMatrixTracked still re-pins all four finders in
+    // THIS exposure and falls back to full acquisition immediately on any miss.
+    const hintedTrack: TrackState | null = !predictedTrack && trackHint
+      ? {
+          centers: trackHint.centers.map(p => ({ x: p.x * w, y: p.y * h })) as TrackState['centers'],
+          ms: trackHint.ms * Math.min(w, h),
+          t: trackHint.t,
+        }
+      : null
+    let located = predictedTrack || hintedTrack ? locateMatrixTracked(px, w, h, predictedTrack ?? hintedTrack!) : null
     if (located) usedTracked = true
     if (!located) located = locateMatrix(px, w, h)
     // If autofocus/exposure drops the static finders for a few captures, keep
@@ -455,8 +479,12 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
           curSenderFps = timing.fps
           curTimingTick = timing.tick
           curTimingLane = timing.lane
-          const sharedTick = timingState ? Atomics.load(new Int32Array(timingState), timing.lane) : -1
-          if (timing.tick === sharedTick || (sharedTick < 0 && lastTimingTick != null && timing.tick === lastTimingTick)) {
+          const claim = curTimingSharedState
+            ? claimTimingTick(curTimingSharedState, timing.lane, timing.tick)
+            : TIMING_UNCLAIMED
+          curTimingClaimSlot = claim >= 0 ? claim : TIMING_UNCLAIMED
+          if (claim === TIMING_DUPLICATE
+            || (!curTimingSharedState && lastTimingTick != null && timing.tick === lastTimingTick)) {
             curDuplicateFrame = true
             reply({ id, result: null, found: true, looks: rx?.looks ?? 0, combinedWins: rx?.combinedWins ?? 0 })
             return
@@ -479,12 +507,20 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
         // normally converges before that, while a hopeless frame can no longer pin
         // one worker for the full 24 rounds. Fountain redundancy is more valuable
         // than spending a second rescuing one equation.
-        const fastColor8 = known.enc === 'color8' && known.gridW <= 64 && known.gridH <= 64
+        // Fast 72² carries 27.6% more bytes than 64², but remains in the same
+        // bounded CPU class. Keep its marginal-frame rescue at 12 iterations;
+        // allowing the generic 24 here would erase the density gain in BP time.
+        const fastColor8 = known.enc === 'color8' && known.gridW <= 72 && known.gridH <= 72
         rx = new SoftReceiver(cap, known.rate ?? 0.6, denseBw ? 12 : fastColor8 ? 12 : 24, false)
       }
+      // Fast Color8 cells occupy roughly 10–14 camera pixels after registration.
+      // A centred 3×3 window therefore stays well inside one symbol and retains a
+      // useful variance/reliability estimate. The generic 5×5 window performed
+      // 129,600 RGB pixel reads at 72² and made the density gain CPU-bound.
+      const fastColorWindow = known.enc === 'color8' && known.gridW <= 72 && known.gridH <= 72 ? 1 : 2
       const cpuSample = (): CellReadings => known.enc === 'bw'
         ? sampleMappedBinary(px, w, h, map, known.gridW, known.gridH)
-        : sampleMapped(px, w, h, map, known.gridW, known.gridH)
+        : sampleMapped(px, w, h, map, known.gridW, known.gridH, fastColorWindow)
       const validationKey = `${known.enc}:${known.gridW}x${known.gridH}`
       if (gpuValidationKey && gpuValidationKey !== validationKey) resetGpuValidation()
       if (!gpuValidationKey) gpuValidationKey = validationKey
@@ -717,8 +753,19 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
   }
 }
 
-function reply(r: Omit<DecodeReply, 'ms' | 'wasm' | 'spatialSimd' | 'webGpu' | 'gpuSampleMs' | 'webGpuStatus' | 'webGpuReason' | 'dark' | 'quad' | 'tracked' | 'phase' | 'colorConfidence' | 'superLooks' | 'superWins' | 'spatialBlur' | 'senderFps' | 'timingTick' | 'timingLane' | 'duplicateFrame'>) {
-  ;(self as unknown as Worker).postMessage({ ...r, ms: performance.now() - t0, wasm: wasmActive, spatialSimd: spatialSimdActive, webGpu: curWebGpu, gpuSampleMs: curGpuSampleMs, webGpuStatus: gpuStatus, webGpuReason: gpuReason, dark: curDark, quad: curQuad, tracked: curTracked, phase: curPhase, colorConfidence: curColorConfidence, superLooks: superRx?.count ?? 0, superWins, spatialBlur: curSpatialBlur, senderFps: curSenderFps, timingTick: curTimingTick, timingLane: curTimingLane, duplicateFrame: curDuplicateFrame })
+function reply(r: Omit<DecodeReply, 'ms' | 'wasm' | 'spatialSimd' | 'webGpu' | 'gpuSampleMs' | 'webGpuStatus' | 'webGpuReason' | 'dark' | 'quad' | 'tracked' | 'phase' | 'colorConfidence' | 'superLooks' | 'superWins' | 'spatialBlur' | 'senderFps' | 'timingTick' | 'timingLane' | 'duplicateFrame' | 'trackHint'>) {
+  if (curTimingSharedState && curTimingLane != null && curTimingTick != null) {
+    finishTimingClaim(curTimingSharedState, curTimingLane, curTimingTick, curTimingClaimSlot, !!r.result)
+    curTimingClaimSlot = TIMING_UNCLAIMED
+  }
+  const sharedTrack = r.result && trackState
+    ? {
+        centers: trackState.centers.map(p => ({ x: p.x / curFrameW, y: p.y / curFrameH })) as TrackHint['centers'],
+        ms: trackState.ms / Math.min(curFrameW, curFrameH),
+        t: trackState.t,
+      }
+    : undefined
+  ;(self as unknown as Worker).postMessage({ ...r, ms: performance.now() - t0, wasm: wasmActive, spatialSimd: spatialSimdActive, webGpu: curWebGpu, gpuSampleMs: curGpuSampleMs, webGpuStatus: gpuStatus, webGpuReason: gpuReason, dark: curDark, quad: curQuad, tracked: curTracked, phase: curPhase, colorConfidence: curColorConfidence, superLooks: superRx?.count ?? 0, superWins, spatialBlur: curSpatialBlur, senderFps: curSenderFps, timingTick: curTimingTick, timingLane: curTimingLane, duplicateFrame: curDuplicateFrame, trackHint: sharedTrack })
 }
 
 function meanReliability(rel?: Float32Array): number | undefined {

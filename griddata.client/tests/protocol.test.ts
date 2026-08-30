@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { decodeBarcodeRow, decodeTimingBarcodeRow, encodeBarcodeRow, encodeTimingBarcodeRow } from '../src/services/metaBarcode.ts'
 import { FountainDecoder } from '../src/services/fountainDecoder.ts'
 import { indicesForSeed } from '../src/services/fountainDecoder.ts'
-import { decodeManifestWire, encodeManifestFrames, encodeManifestWire, fountainEncode, packFrameLdpc, parseFrameLdpcSoft, seedForDataIndex, type TransferManifest } from '../src/services/transferCodec.ts'
+import { buildTransfer, decodeManifestWire, encodeManifestFrames, encodeManifestWire, finishTransfer, fountainEncode, FRAME_TYPE_DATA, maxPayload, packFrameLdpc, parseFrameLdpcSoft, seedForDataIndex, type TransferManifest } from '../src/services/transferCodec.ts'
 import { capacityBytes, encodeCellsRGB, equalizeSpatialReadings, softDemodLLR, type EncodingSpec } from '../src/services/visualCodec.ts'
 import { encodeHierarchicalCells, hierarchicalLayout, hierarchicalSeeds, softDemodHierarchical } from '../src/services/hierarchicalCodec.ts'
 import { estimateSubpixelShift, fuseLooks } from '../src/services/superReceiver.ts'
@@ -12,6 +12,8 @@ import { homographyCoefficients } from '../src/services/webGpuGridSampler.ts'
 import { ldpcEncodeParity, makeLdpcKM } from '../src/services/ldpc.ts'
 import { instantiateLdpcWasm } from '../src/services/ldpcWasmCore.ts'
 import { assessOpticalLink } from '../src/services/opticalCalibration.ts'
+import { sampleMapped } from '../src/services/matrixVision.ts'
+import { claimTimingTick, finishTimingClaim, TIMING_DUPLICATE, TIMING_STATE_WORDS, TIMING_UNCLAIMED } from '../src/services/timingClaims.ts'
 
 test('calibration rates measured Turbo useful capacity instead of an impossible raw ceiling', () => {
   const result = assessOpticalLink({
@@ -67,6 +69,91 @@ test('metadata barcode preserves the exact non-zoned grid', () => {
   for (let cell = 0; cell < 64; cell++) luminance[cell] = row[cell * 3]
   const decoded = decodeBarcodeRow(luminance, 64)
   assert.deepEqual(decoded, { version: 1, enc: 'color8', rate: 0.65, zones: false, ringWidth: 0, gridW: 64, gridH: 64 })
+})
+
+test('Fast 72x72 raises payload capacity while preserving exact barcode geometry', () => {
+  const spec: EncodingSpec = { enc: 'color8', gridW: 72, gridH: 72, rate: 0.625 }
+  assert.equal(maxPayload(spec), 1151)
+  assert.ok(maxPayload(spec) > maxPayload({ ...spec, gridW: 64, gridH: 64 }) * 1.27)
+  const row = encodeBarcodeRow({ version: 2, enc: 'color8', rate: 0.625, zones: false, ringWidth: 0, gridW: 72, gridH: 72, lanes: 2 }, 72)
+  const luminance = Float32Array.from({ length: 72 }, (_, cell) => row[cell * 3])
+  const decoded = decodeBarcodeRow(luminance, 72)
+  assert.equal(decoded?.gridW, 72)
+  assert.equal(decoded?.gridH, 72)
+  assert.equal(decoded?.lanes, 2)
+})
+
+test('Fast 72x72 completes a clean end-to-end v9 transfer', async () => {
+  const spec: EncodingSpec = { enc: 'color8', gridW: 72, gridH: 72, rate: 0.625 }
+  const raw = new Uint8Array(18_000)
+  let state = 0x12345678
+  for (let i = 0; i < raw.length; i++) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0
+    raw[i] = state >>> 24
+  }
+  const built = await buildTransfer(raw, { kind: 'file', name: 'fast72.bin', mime: 'application/octet-stream' }, {
+    spec, chunkSize: maxPayload(spec), frameCount: 1, fps: 12, lanes: 2, systematicRun: 8,
+  })
+  assert.equal(built.manifest.v, 9)
+  assert.equal(built.manifest.chunk, 1151)
+  const decoder = new FountainDecoder(built.manifest.k, built.manifest.chunk, true, 2)
+  const capacity = capacityBytes(spec)
+  for (let index = 0; index < built.frameCount && !decoder.isComplete; index++) {
+    const frame = built.frameAt(index)
+    const llr = new Float32Array(capacity * 8)
+    for (let byte = 0; byte < frame.length; byte++) for (let bit = 0; bit < 8; bit++)
+      llr[byte * 8 + bit] = frame[byte] & (1 << (7 - bit)) ? -12 : 12
+    const parsed = parseFrameLdpcSoft(llr, capacity, spec.rate)
+    if (parsed?.type === FRAME_TYPE_DATA) decoder.addFrame(parsed.seed, parsed.payload)
+  }
+  assert.equal(decoder.isComplete, true)
+  assert.deepEqual(await finishTransfer(decoder.reconstruct(), built.manifest), raw)
+})
+
+test('Fast 72x72 centred 3x3 camera sampler preserves an LDPC frame under sensor noise', () => {
+  const spec: EncodingSpec = { enc: 'color8', gridW: 72, gridH: 72, rate: 0.625 }
+  const capacity = capacityBytes(spec)
+  const payload = Uint8Array.from({ length: 700 }, (_, i) => (i * 73 + 19) & 0xff)
+  const packed = packFrameLdpc(FRAME_TYPE_DATA, 0x72fa5701, payload, capacity, spec.rate)
+  const cells = encodeCellsRGB(packed, spec)
+  const cellPx = 10, w = spec.gridW * cellPx, h = spec.gridH * cellPx
+  const pixels = new Uint8ClampedArray(w * h * 4)
+  let noise = 0x5eed1234
+  for (let gy = 0; gy < spec.gridH; gy++) for (let gx = 0; gx < spec.gridW; gx++) {
+    const ci = (gy * spec.gridW + gx) * 3
+    for (let y = 0; y < cellPx; y++) for (let x = 0; x < cellPx; x++) {
+      noise = (Math.imul(noise, 1664525) + 1013904223) >>> 0
+      const jitter = ((noise >>> 24) % 31) - 15
+      const p = ((gy * cellPx + y) * w + gx * cellPx + x) * 4
+      pixels[p] = cells[ci] + jitter
+      pixels[p + 1] = cells[ci + 1] + jitter
+      pixels[p + 2] = cells[ci + 2] + jitter
+      pixels[p + 3] = 255
+    }
+  }
+  const readings = sampleMapped(pixels, w, h, (u, v) => ({ x: u * w, y: v * h }), spec.gridW, spec.gridH, 1)
+  const parsed = parseFrameLdpcSoft(softDemodLLR(readings, spec), capacity, spec.rate, false, 12)
+  assert.equal(parsed?.seed, 0x72fa5701)
+  assert.deepEqual(parsed?.payload, payload)
+})
+
+test('Turbo timing claims suppress the same tick but pipeline different ticks and release failures', () => {
+  const state = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * TIMING_STATE_WORDS))
+  state.fill(TIMING_UNCLAIMED)
+  const first = claimTimingTick(state, 0, 41)
+  assert.ok(first >= 0)
+  assert.equal(claimTimingTick(state, 0, 41), TIMING_DUPLICATE)
+  const next = claimTimingTick(state, 0, 42)
+  assert.ok(next >= 0 && next !== first)
+  // A failed decode releases only its own reservation, allowing a later retry.
+  finishTimingClaim(state, 0, 41, first, false)
+  const retry = claimTimingTick(state, 0, 41)
+  assert.ok(retry >= 0)
+  finishTimingClaim(state, 0, 41, retry, true)
+  assert.equal(claimTimingTick(state, 0, 41), TIMING_DUPLICATE)
+  // Lane 1 is independent from lane 0 even when its tick number is identical.
+  assert.ok(claimTimingTick(state, 1, 41) >= 0)
+  finishTimingClaim(state, 0, 42, next, false)
 })
 
 test('metadata barcode carries the 0.625 tuned LDPC rate', () => {

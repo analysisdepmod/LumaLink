@@ -30,7 +30,12 @@ class Yuv420Frame {
   final int uPixelStride;
   final int vPixelStride;
 
-  LumaPlane get luma => LumaPlane(width: width, height: height, bytes: y, bytesPerRow: yRowStride);
+  LumaPlane get luma => LumaPlane(
+    width: width,
+    height: height,
+    bytes: y,
+    bytesPerRow: yRowStride,
+  );
 
   (double, double, double) rgbAt(int x, int yPos) {
     final safeX = x < 0 ? 0 : (x >= width ? width - 1 : x);
@@ -52,7 +57,11 @@ class Yuv420Frame {
 
 /// Samples a located Color8 matrix without allocating a full RGB camera bitmap.
 /// Android's YUV planes stay native until only the 64×64 cell centres are read.
-Color8Grid sampleColor8(Yuv420Frame image, MatrixRect outer, BarcodeData barcode) {
+Color8Grid sampleColor8(
+  Yuv420Frame image,
+  MatrixRect outer,
+  BarcodeData barcode,
+) {
   final data = outer.dataRegion;
   final cells = barcode.gridWidth * barcode.gridHeight;
   final red = Float32List(cells);
@@ -61,7 +70,11 @@ Color8Grid sampleColor8(Yuv420Frame image, MatrixRect outer, BarcodeData barcode
   final reliability = Float32List(cells);
   final cellWidth = data.width / barcode.gridWidth;
   final cellHeight = data.height / barcode.gridHeight;
-  final radius = math.max(0, math.min(cellWidth, cellHeight).floor() ~/ 4).toInt();
+  // Fast 64/72 profile: a bounded 3×3 centre sample avoids mixing neighbouring
+  // colours and cuts YUV work sharply on mobile CPUs.
+  final radius = math
+      .min(1, math.max(0, math.min(cellWidth, cellHeight).floor() ~/ 4))
+      .toInt();
   for (var gy = 0; gy < barcode.gridHeight; gy++) {
     for (var gx = 0; gx < barcode.gridWidth; gx++) {
       final centreX = data.left + (gx + 0.5) * cellWidth;
@@ -74,7 +87,10 @@ Color8Grid sampleColor8(Yuv420Frame image, MatrixRect outer, BarcodeData barcode
       var count = 0;
       for (var dy = -radius; dy <= radius; dy++) {
         for (var dx = -radius; dx <= radius; dx++) {
-          final rgb = image.rgbAt((centreX + dx).round(), (centreY + dy).round());
+          final rgb = image.rgbAt(
+            (centreX + dx).round(),
+            (centreY + dy).round(),
+          );
           sr += rgb.$1;
           sg += rgb.$2;
           sb += rgb.$3;

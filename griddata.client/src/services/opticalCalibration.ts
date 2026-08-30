@@ -10,6 +10,8 @@ export interface OpticalCalibrationInput {
   chunkBytes: number
   ldpcRate?: number
   senderFps: number | null | undefined
+  gridW?: number
+  gridH?: number
   /** Number of independent optical lanes carrying disjoint fountain frames. */
   lanes?: number
   /** Mean optical reliability measured while sampling the colour cells. */
@@ -25,7 +27,8 @@ export interface OpticalCalibration {
 
 export function assessOpticalLink(input: OpticalCalibrationInput): OpticalCalibration {
   const laneCount = Math.max(1, input.lanes ?? 1)
-  const turboProfile = `Turbo ×${laneCount} Color8 64×64 @ ${input.senderFps ?? 5.5}fps`
+  const gridLabel = `${input.gridW ?? 64}×${input.gridH ?? input.gridW ?? 64}`
+  const turboProfile = `Turbo ×${laneCount} Color8 ${gridLabel} @ ${input.senderFps ?? 5.5}fps`
   const rate = input.ldpcRate ?? 0.625
   const theoreticalKBs = input.senderFps && input.senderFps > 0
     ? input.chunkBytes * input.senderFps * laneCount / 1024
