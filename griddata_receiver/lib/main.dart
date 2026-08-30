@@ -1,16 +1,15 @@
 import 'dart:async';
+import 'dart:isolate';
+import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 
-import 'protocol/color8.dart';
+import 'native_decode_worker.dart';
 import 'protocol/frame_codec.dart';
-import 'protocol/frame_locator.dart';
 import 'protocol/fountain_decoder.dart';
 import 'protocol/meta_barcode.dart';
-import 'protocol/multicolor.dart';
 import 'protocol/transfer_manifest.dart';
-import 'protocol/yuv_sampler.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -63,12 +62,26 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   TransferManifest? _manifest;
   FountainDecoder? _fountain;
   bool _savingTransfer = false;
+  final ReceivePort _decodeReplies = ReceivePort();
+  SendPort? _decodeRequests;
+  Isolate? _decodeIsolate;
+  int _decodeRequestId = 0;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    unawaited(_startDecoder());
     unawaited(_openCamera());
+  }
+
+  Future<void> _startDecoder() async {
+    _decodeReplies.listen(_onDecodeMessage);
+    _decodeIsolate = await Isolate.spawn(
+      nativeDecodeWorkerEntry,
+      _decodeReplies.sendPort,
+      debugName: 'LumaLink native optical decoder',
+    );
   }
 
   Future<void> _openCamera() async {
@@ -105,7 +118,8 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   }
 
   void _onFrame(CameraImage image) {
-    if (_busy || image.planes.length < 3) return;
+    final decoder = _decodeRequests;
+    if (_busy || decoder == null || image.planes.length < 3) return;
     final nowUs = DateTime.now().microsecondsSinceEpoch;
     _windowFrames++;
     final elapsed = DateTime.now().difference(_windowStarted).inMilliseconds;
@@ -118,80 +132,69 @@ class _ReceiverScreenState extends State<ReceiverScreen>
     if (nowUs < _nextDecodeUs) return;
     _nextDecodeUs = nowUs + (1000000 / _senderFps.clamp(2, 30)).round();
     _busy = true;
-    final watch = Stopwatch()..start();
-    try {
-      _decodeExposure(image);
-    } finally {
-      watch.stop();
-      _decodeMs = watch.elapsedMicroseconds / 1000;
-      _busy = false;
-    }
+    decoder.send(<String, Object?>{
+      'id': ++_decodeRequestId,
+      'width': image.width,
+      'height': image.height,
+      'y': TransferableTypedData.fromList(<Uint8List>[image.planes[0].bytes]),
+      'u': TransferableTypedData.fromList(<Uint8List>[image.planes[1].bytes]),
+      'v': TransferableTypedData.fromList(<Uint8List>[image.planes[2].bytes]),
+      'yRowStride': image.planes[0].bytesPerRow,
+      'uRowStride': image.planes[1].bytesPerRow,
+      'vRowStride': image.planes[2].bytesPerRow,
+      'uPixelStride': image.planes[1].bytesPerPixel ?? 1,
+      'vPixelStride': image.planes[2].bytesPerPixel ?? 1,
+      'barcodes': _barcodes
+          .map((value) => value == null ? null : barcodeToMessage(value))
+          .toList(),
+      'lastTicks': List<int>.from(_lastTicks),
+    });
   }
 
-  void _decodeExposure(CameraImage image) {
-    final frame = Yuv420Frame(
-      width: image.width,
-      height: image.height,
-      y: image.planes[0].bytes,
-      u: image.planes[1].bytes,
-      v: image.planes[2].bytes,
-      yRowStride: image.planes[0].bytesPerRow,
-      uRowStride: image.planes[1].bytesPerRow,
-      vRowStride: image.planes[2].bytesPerRow,
-      uPixelStride: image.planes[1].bytesPerPixel ?? 1,
-      vPixelStride: image.planes[2].bytesPerPixel ?? 1,
-    );
-    final outers = locateOuterFrames(frame.luma, maxCount: 2);
-    if (outers.isEmpty) return;
-    for (var visualIndex = 0; visualIndex < outers.length; visualIndex++) {
-      final outer = outers[visualIndex];
-      final found = locateBarcode(frame.luma, outer);
-      final barcode = found ?? _barcodes[visualIndex];
-      if (barcode == null || barcode.gridWidth == 0) continue;
-      final timing = locateTimingBarcode(frame.luma, outer, barcode);
-      final lane = timing?.lane ?? visualIndex.clamp(0, 1);
+  void _onDecodeMessage(Object? message) {
+    if (message is SendPort) {
+      _decodeRequests = message;
+      return;
+    }
+    if (message is! Map) return;
+    _busy = false;
+    _decodeMs = (message['ms'] as num?)?.toDouble() ?? 0;
+    final results = message['results'] as List? ?? const <Object?>[];
+    for (final value in results) {
+      if (value is! Map || value['lane'] is! int) continue;
+      final lane = value['lane'] as int;
+      if (lane < 0 || lane > 1) continue;
+      final barcode = barcodeFromMessage(value['barcode']);
+      if (barcode == null) continue;
       _barcodes[lane] = barcode;
-      if (timing != null) {
-        if (_lastTicks[lane] == timing.tick) continue;
-        _senderFps = timing.fps.clamp(2, 30);
-      }
-      final sampled = sampleColor8(frame, outer, barcode);
-      final capacity = switch (barcode.encoding) {
-        GridEncoding.bw => bwCapacityBytes(
-          barcode.gridWidth,
-          barcode.gridHeight,
-        ),
-        GridEncoding.color8 => color8CapacityBytes(
-          barcode.gridWidth,
-          barcode.gridHeight,
-        ),
-        _ => multiColorCapacityBytes(sampled, barcode.encoding),
-      };
-      final llr = switch (barcode.encoding) {
-        GridEncoding.bw => softDemodulateBw(sampled),
-        GridEncoding.color8 => softDemodulateColor8(sampled),
-        _ => softDemodulateMultiColor(sampled, barcode.encoding),
-      };
-      final decoded = decodeFrameLlr(
-        llr,
-        capacity,
-        barcode.rate,
-        iterations:
-            barcode.encoding == GridEncoding.color8 && barcode.gridWidth <= 72
-            ? 12
-            : 16,
-      );
-      if (decoded == null) continue;
-      if (timing != null) _lastTicks[lane] = timing.tick;
+      final fps = value['fps'];
+      if (fps is num) _senderFps = fps.toDouble().clamp(2, 30);
+      if (value['duplicate'] == true) continue;
+      final type = value['type'];
+      final seed = value['seed'];
+      final payload = value['payload'];
+      if (type is! int || seed is! int || payload is! TransferableTypedData)
+        continue;
+      final tick = value['tick'];
+      if (tick is int) _lastTicks[lane] = tick;
       _validFrames++;
-      _acceptFrame(decoded, barcode);
+      _acceptFrame(
+        DecodedFrame(
+          type: type,
+          seed: seed,
+          payload: payload.materialize().asUint8List(),
+        ),
+        barcode,
+      );
     }
     if (mounted && _manifest == null) {
       setState(
-        () => _state = _barcodes.any((value) => value != null)
+        () => _state = message['locked'] == true
             ? 'تم القفل على المصفوفة — جاري استلام معلومات الملف'
             : 'جاري البحث عن المصفوفة',
       );
+    } else if (mounted) {
+      setState(() {});
     }
   }
 
@@ -203,7 +206,9 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       _fountain = FountainDecoder(
         manifest.k,
         manifest.chunkSize,
-        mediumWideEvery: manifest.version == 8 ? 1 : (manifest.version >= 9 ? 2 : 4),
+        mediumWideEvery: manifest.version == 8
+            ? 1
+            : (manifest.version >= 9 ? 2 : 4),
       );
       if (manifest.senderFps != null)
         _senderFps = manifest.senderFps!.clamp(2, 30);
@@ -260,6 +265,8 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     unawaited(_camera?.dispose());
+    _decodeIsolate?.kill(priority: Isolate.immediate);
+    _decodeReplies.close();
     super.dispose();
   }
 
