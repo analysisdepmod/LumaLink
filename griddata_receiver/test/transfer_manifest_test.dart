@@ -44,12 +44,12 @@ void main() {
     expect(manifest.senderFps, 6.5);
   });
 
-  test('decodes compact protocol v9 manifest using barcode geometry', () {
+  test('decodes compact protocol v10 manifest using barcode geometry', () {
     final name = utf8.encode('sample.pdf');
     final mime = utf8.encode('application/pdf');
     final wire = Uint8List(61 + name.length + mime.length);
     final view = ByteData.sublistView(wire);
-    wire.setAll(0, [0x47, 0x44, 0x02, 9]);
+    wire.setAll(0, [0x47, 0x44, 0x02, 10]);
     var offset = 4;
     view.setUint32(offset, 123, Endian.little);
     offset += 4;
@@ -83,7 +83,7 @@ void main() {
         lanes: 2,
       ),
     );
-    expect(manifest?.version, 9);
+    expect(manifest?.version, 10);
     expect(manifest?.chunkSize, 1151);
     expect(manifest?.gridWidth, 72);
     expect(manifest?.senderFps, 12);

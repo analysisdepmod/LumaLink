@@ -7,7 +7,7 @@ const MAX_REPORTS = 5000
  * deliberately used instead of a server call: an optical transfer must remain
  * completely usable when the display and camera devices have no network link.
  */
-export function saveDiagnosticReport(report: string): Promise<void> {
+function saveToIndexedDb(report: string): Promise<void> {
   if (typeof indexedDB === 'undefined') return Promise.resolve()
   return new Promise(resolve => {
     const open = indexedDB.open(DB_NAME, 1)
@@ -38,4 +38,26 @@ export function saveDiagnosticReport(report: string): Promise<void> {
       tx.onerror = tx.onabort = () => { db.close(); resolve() }
     }
   })
+}
+
+/**
+ * Save every completed report in both places when possible:
+ *   1. the receiver browser (offline fallback), and
+ *   2. GridData.Server/diagnostics as a normal JSON file for later inspection.
+ *
+ * The server request is same-origin and contains diagnostics only. The optical
+ * payload/file bytes are never included.
+ */
+export async function saveDiagnosticReport(report: string): Promise<void> {
+  const localSave = saveToIndexedDb(report)
+  const serverSave = typeof fetch === 'undefined'
+    ? Promise.resolve()
+    : fetch('/api/diagnostics', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: report,
+      }).then(response => {
+        if (!response.ok) throw new Error(`diagnostic save failed: HTTP ${response.status}`)
+      }).catch(() => { /* IndexedDB remains the offline fallback. */ })
+  await Promise.all([localSave, serverSave])
 }

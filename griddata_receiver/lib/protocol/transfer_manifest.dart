@@ -54,7 +54,7 @@ class TransferManifest {
       return number >= min && number <= max ? number : null;
     }
 
-    final version = integer('v', 1, 9);
+    final version = integer('v', 1, 10);
     final id = integer('id', 0, 0xffffffff);
     final total = integer('total', 0, 1073741824);
     final compressedBytes = integer('comp', 0, 1073741824);
@@ -172,7 +172,7 @@ TransferManifest? _decodeCompactManifest(Uint8List body, BarcodeData? optical) {
     return null;
   var offset = 3;
   final version = body[offset++];
-  if (version < 6 || version > 9) return null;
+  if (version < 6 || version > 10) return null;
   final id = _u32(body, offset);
   offset += 4;
   final flags = body[offset++];

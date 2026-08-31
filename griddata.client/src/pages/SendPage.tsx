@@ -67,9 +67,9 @@ export default function SendPage() {
   // v7: four systematic chunks followed by one repair. Repairs retain the
   // paired-loss-safe w2 mapping selected in transferCodec; the shorter direct
   // run spreads recovery equations earlier without the failed all-wide tail.
-  // v9 keeps the field-proven eight systematic chunks per repair. It reaches the
-  // complete source pass earlier than v8's 4:1 schedule, while the timer-free
-  // packed tail worker closes losses without the former end-of-transfer pause.
+  // Retained for legacy/zoned manifests. Normal v10 transfers use the balanced
+  // 1:1 full-carousel schedule in transferCodec so direct chunks never disappear
+  // into a repair-only tail.
   const systematicRun = 8
   const hasSource = source === 'file' ? !!file : text.trim().length > 0
   const resetBuilt = () => setBuilt(null)

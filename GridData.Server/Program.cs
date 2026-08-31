@@ -51,7 +51,10 @@ const int MaxDiagnosticReports = 5000;
 
 app.MapPost("/api/diagnostics", async (HttpRequest request) =>
 {
-    const int maxReportBytes = 64 * 1024;
+    // A second-by-second timeline for a long transfer is intentionally detailed.
+    // Eight MiB covers multi-hour field runs while still bounding request memory
+    // and preventing accidental payload uploads to this diagnostics-only route.
+    const int maxReportBytes = 8 * 1024 * 1024;
     if (request.ContentLength is > maxReportBytes)
         return Results.BadRequest(new { error = "Diagnostic report is too large." });
 

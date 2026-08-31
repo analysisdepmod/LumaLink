@@ -36,7 +36,7 @@ export const FRAME_TYPE_DATA = 1
 export const FRAME_TYPE_SOLO = 2 // whole transfer in one static frame
 
 export interface TransferManifest {
-  v: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
+  v: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10
   id: number            // random id — receiver detects a new transfer by this
   kind: 'file' | 'text'
   name: string          // filename ('' for text)
@@ -63,7 +63,7 @@ export function isValidManifest(value: unknown): value is TransferManifest {
   const finite = (n: unknown, min: number, max: number): n is number => typeof n === 'number' && Number.isInteger(n) && n >= min && n <= max
   const gridW = m.gridW
   const gridH = m.gridH
-  return (m.v === 1 || m.v === 2 || m.v === 3 || m.v === 4 || m.v === 5 || m.v === 6 || m.v === 7 || m.v === 8 || m.v === 9)
+  return (m.v === 1 || m.v === 2 || m.v === 3 || m.v === 4 || m.v === 5 || m.v === 6 || m.v === 7 || m.v === 8 || m.v === 9 || m.v === 10)
     && finite(m.id, 0, 0xFFFF_FFFF)
     && (m.kind === 'file' || m.kind === 'text')
     && typeof m.name === 'string' && m.name.length <= 512
@@ -381,6 +381,26 @@ export function seedForDataIndex(dataIndex: number, k: number, directPerRepair =
   return k + repairOrdinal + 1
 }
 
+/**
+ * v10 balanced carousel: spread every original systematic chunk across the
+ * complete ~2K pool instead of front-loading all K direct chunks and leaving a
+ * repair-only tail. Every Turbo tick carries one source and one fresh repair;
+ * their left/right lane roles swap on every tick so a weaker optical lane cannot
+ * become permanently systematic-only or repair-only. No direct packet repeats,
+ * so smoother progress does not sacrifice rank or carousel capacity.
+ */
+export function seedForBalancedDataIndex(dataIndex: number, k: number): number {
+  dataIndex = Math.max(0, Math.floor(dataIndex))
+  k = Math.max(1, Math.floor(k))
+  const tick = Math.floor(dataIndex / 2)
+  const lane = dataIndex & 1
+  if (dataIndex < k * 2 && lane === (tick & 1)) return tick + 1
+  const repairOrdinal = dataIndex < k * 2
+    ? tick + 1
+    : k + (dataIndex - k * 2) + 1
+  return k + repairOrdinal
+}
+
 const textEncoder = new TextEncoder()
 const textDecoder = new TextDecoder()
 
@@ -465,7 +485,7 @@ export function decodeManifestWire(body: Uint8Array, optical?: EncodingSpec): Tr
       const view = new DataView(body.buffer, body.byteOffset, body.byteLength)
       let off = 3
       const v = body[off++]
-      if (v !== 6 && v !== 7 && v !== 8 && v !== 9) return null
+      if (v !== 6 && v !== 7 && v !== 8 && v !== 9 && v !== 10) return null
       const id = view.getUint32(off, true); off += 4
       const flags = body[off++]!
       const fps10 = view.getUint16(off, true); off += 2
@@ -644,7 +664,7 @@ export async function buildTransfer(
   const solo = buildSolo(meta, opts.spec, packed, sha256, zm)
   if (solo) {
     const manifest: TransferManifest = {
-      v: zm ? 5 : 9, id: randomTransferId(),
+      v: zm ? 5 : 10, id: randomTransferId(),
       kind: meta.kind, name: meta.name, mime: meta.mime,
       total: raw.length, comp: packed.bytes.length, compressed: packed.compressed, sha256,
       k: 1, chunk: packed.bytes.length,
@@ -658,7 +678,7 @@ export async function buildTransfer(
   const k = Math.max(1, Math.ceil(packed.bytes.length / chunkSize))
 
   const manifest: TransferManifest = {
-    v: zm ? 5 : 9,
+    v: zm ? 5 : 10,
     id: randomTransferId(),
     kind: meta.kind,
     name: meta.name,
@@ -743,7 +763,9 @@ export async function buildTransfer(
         frame = manifestFrames[(inGroup - manifestEvery) % manifestFrames.length]!
       } else {
         const dataIndex = group * manifestEvery + inGroup
-        const seed = seedForDataIndex(dataIndex, k, opts.systematicRun ?? 8)
+        const seed = manifest.v >= 10
+          ? seedForBalancedDataIndex(dataIndex, k)
+          : seedForDataIndex(dataIndex, k, opts.systematicRun ?? 8)
         frame = packFrame(FRAME_TYPE_DATA, seed, fountainEncodePayload(packed.bytes, k, seed, chunkSize, mediumWideEvery), capacity, rate)
       }
     }

@@ -56,8 +56,10 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   DateTime _windowStarted = DateTime.now();
   bool _busy = false;
   bool _torch = false;
+  static const int _maxPendingDataFrames = 192;
   final List<BarcodeData?> _barcodes = <BarcodeData?>[null, null];
   final List<int> _lastTicks = <int>[-1, -1];
+  final List<DecodedFrame> _pendingData = <DecodedFrame>[];
   final ManifestAssembler _manifestAssembler = ManifestAssembler();
   TransferManifest? _manifest;
   FountainDecoder? _fountain;
@@ -66,6 +68,7 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   SendPort? _decodeRequests;
   Isolate? _decodeIsolate;
   int _decodeRequestId = 0;
+  String? _decoderError;
 
   @override
   void initState() {
@@ -159,6 +162,10 @@ class _ReceiverScreenState extends State<ReceiverScreen>
     if (message is! Map) return;
     _busy = false;
     _decodeMs = (message['ms'] as num?)?.toDouble() ?? 0;
+    final workerError = message['error'];
+    if (workerError is String && workerError.isNotEmpty) {
+      _decoderError = workerError;
+    }
     final results = message['results'] as List? ?? const <Object?>[];
     for (final value in results) {
       if (value is! Map || value['lane'] is! int) continue;
@@ -178,6 +185,7 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       final tick = value['tick'];
       if (tick is int) _lastTicks[lane] = tick;
       _validFrames++;
+      _decoderError = null;
       _acceptFrame(
         DecodedFrame(
           type: type,
@@ -212,13 +220,38 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       );
       if (manifest.senderFps != null)
         _senderFps = manifest.senderFps!.clamp(2, 30);
-      if (mounted) setState(() => _state = 'بدأ الاستلام: ${manifest.name}');
+      // Turbo can deliver valid data while the receiver is still assembling
+      // the repeated manifest. Keep those frames and replay them immediately;
+      // dropping them made the phone look completely idle with short files and
+      // unnecessarily delayed every larger transfer.
+      final earlyFrames = List<DecodedFrame>.from(_pendingData);
+      _pendingData.clear();
+      for (final early in earlyFrames) {
+        _fountain!.addFrame(early.seed, early.payload);
+      }
+      if (mounted) {
+        setState(
+          () => _state = earlyFrames.isEmpty
+              ? 'بدأ الاستلام: ${manifest.name}'
+              : 'بدأ الاستلام: ${manifest.name} — استُعيدت ${earlyFrames.length} حزمة مبكرة',
+        );
+      }
+      if (_fountain!.isComplete) {
+        _savingTransfer = true;
+        unawaited(_finish(_fountain!, manifest));
+      }
       return;
     }
     if (frame.type != frameData) return;
     final manifest = _manifest;
     final fountain = _fountain;
-    if (manifest == null || fountain == null || _savingTransfer) return;
+    if (manifest == null || fountain == null) {
+      if (_pendingData.length < _maxPendingDataFrames) {
+        _pendingData.add(frame);
+      }
+      return;
+    }
+    if (_savingTransfer) return;
     fountain.addFrame(frame.seed, frame.payload);
     if (mounted) setState(() => _state = 'استلام ${manifest.name}');
     if (fountain.isComplete) {
@@ -304,6 +337,8 @@ class _ReceiverScreenState extends State<ReceiverScreen>
                     senderFps: _senderFps,
                     decodeMs: _decodeMs,
                     turbo: _barcodes.any((value) => value?.lanes == 2),
+                    bufferedFrames: _pendingData.length,
+                    decoderError: _decoderError,
                   ),
                 ],
               ),
@@ -372,12 +407,16 @@ class _StatusCard extends StatelessWidget {
     required this.senderFps,
     required this.decodeMs,
     required this.turbo,
+    required this.bufferedFrames,
+    required this.decoderError,
   });
   final String state;
   final double progress;
   final int chunks, total, equations, validFrames;
   final double captureFps, senderFps, decodeMs;
   final bool turbo;
+  final int bufferedFrames;
+  final String? decoderError;
 
   @override
   Widget build(BuildContext context) => Container(
@@ -416,6 +455,19 @@ class _StatusCard extends StatelessWidget {
           'فك ${decodeMs.toStringAsFixed(0)}ms  •  إطارات صحيحة $validFrames',
           style: const TextStyle(color: Colors.white70, fontSize: 12),
         ),
+        if (total == 0 && bufferedFrames > 0)
+          Text(
+            'حزم بيانات محفوظة بانتظار معلومات الملف: $bufferedFrames',
+            style: const TextStyle(color: Color(0xffffd166), fontSize: 12),
+          ),
+        if (decoderError != null)
+          Text(
+            'خطأ فك الترميز: $decoderError',
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Color(0xffff7b7b), fontSize: 11),
+          ),
       ],
     ),
   );

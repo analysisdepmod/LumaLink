@@ -22,7 +22,12 @@ const DELTA = 0.5
 // available. 128 is still a small worker-local system (about 116 KiB of payload
 // at the measured 902-byte chunks), but lets elimination close the graph sooner.
 const DENSE_TAIL_LIMIT = 128
+const RANK_COMPLETE_SOLVE_LIMIT = 512
 const DENSE_TAIL_RETRY_MASK = 3
+// Exact online GF(2) rank is cheap for normal optical transfers (the measured
+// files are a few hundred chunks). Bound it so an unexpectedly huge manifest
+// cannot allocate a quadratic coefficient basis on the receiver main thread.
+const EXACT_RANK_LIMIT = 8192
 const cdfCache = new Map<number, Float64Array>()
 
 function buildCdf(k: number): Float64Array {
@@ -106,6 +111,40 @@ function xorInto(dst: Uint8Array, src: Uint8Array): void {
   for (let i = 0; i < n; i++) dst[i] ^= src[i]
 }
 
+class BinaryRankTracker {
+  readonly exact: boolean
+  private readonly words: number
+  private readonly basis: Array<Uint32Array | null>
+  rank = 0
+
+  constructor(k: number) {
+    this.exact = k <= EXACT_RANK_LIMIT
+    this.words = this.exact ? Math.ceil(k / 32) : 0
+    this.basis = this.exact ? new Array(k).fill(null) : []
+  }
+
+  add(indices: number[]): boolean {
+    if (!this.exact) return false
+    const row = new Uint32Array(this.words)
+    for (const index of indices) row[index >>> 5] |= (1 << (index & 31)) >>> 0
+    while (true) {
+      let pivot = -1
+      for (let wordIndex = 0; wordIndex < row.length; wordIndex++) {
+        const word = row[wordIndex]
+        if (word) { pivot = (wordIndex << 5) + 31 - Math.clz32(word & -word); break }
+      }
+      if (pivot < 0) return false
+      const prior = this.basis[pivot]
+      if (!prior) {
+        this.basis[pivot] = row
+        this.rank++
+        return true
+      }
+      for (let wordIndex = pivot >>> 5; wordIndex < row.length; wordIndex++) row[wordIndex] ^= prior[wordIndex]
+    }
+  }
+}
+
 export class FountainDecoder {
   readonly k: number
   readonly chunkSize: number
@@ -123,17 +162,24 @@ export class FountainDecoder {
   private tailWorker: Worker | null = null
   private tailSolveInFlight = false
   private tailWorkerDisabled = false
+  private readonly rankTracker: BinaryRankTracker
+  private approximateRank = 0
+  private dependentEquationCount = 0
 
   constructor(k: number, chunkSize: number, tailRepair = true, private readonly mediumWideEvery = 4, private readonly onComplete?: () => void) {
     this.k = k
     this.chunkSize = chunkSize
     this.tailRepair = tailRepair
     this.decoded = new Array(k).fill(null)
+    this.rankTracker = new BinaryRankTracker(k)
   }
 
   get isComplete(): boolean { return this.decodedCount >= this.k }
   get uniqueChunks(): number { return this.decodedCount }
   get receivedEquations(): number { return this.seenSeeds.size }
+  get innovativeRank(): number { return this.rankTracker.exact ? this.rankTracker.rank : Math.max(this.decodedCount, this.approximateRank) }
+  get rankIsExact(): boolean { return this.rankTracker.exact }
+  get dependentEquations(): number { return this.dependentEquationCount }
   get tailSolverAttempts(): number { return this.denseTailAttempts }
   get tailSolverChunks(): number { return this.denseTailChunks }
   get tailSolverMs(): number { return this.denseTailMs }
@@ -149,6 +195,13 @@ export class FountainDecoder {
     if (this.seenSeeds.has(seed)) return false
     this.seenSeeds.add(seed)
     const indices = indicesForSeed(seed, this.k, this.tailRepair, this.mediumWideEvery)
+    if (this.rankTracker.exact) {
+      if (!this.rankTracker.add(indices)) this.dependentEquationCount++
+    } else {
+      // For very large K avoid a quadratic basis. Unique seeded equations are a
+      // conservative operational estimate; decodedCount remains a hard floor.
+      this.approximateRank = Math.min(this.k, this.approximateRank + 1)
+    }
     const remaining = new Set<number>()
     const payload = new Uint8Array(this.chunkSize)
     payload.set(data.subarray(0, this.chunkSize))
@@ -169,7 +222,7 @@ export class FountainDecoder {
     // If ordinary peeling won the race, stop an older background tail job so it
     // cannot publish a second completion after ReceivePage has already finished.
     if (this.isComplete) this.dispose()
-    else this.tryDenseTailSolve()
+    else this.tryDenseTailSolve(this.rankTracker.exact && this.rankTracker.rank >= this.k)
     return true
   }
 
@@ -178,16 +231,18 @@ export class FountainDecoder {
    * set of mutually-entangled repair equations at the end.  Waiting for a rare
    * degree-one equation is the familiar slow 95–99% optical-transfer tail.
    *
-   * When at most 128 chunks remain, solve the already received repair equations
-   * with bounded GF(2) elimination.  Equations have already had known chunks
-   * removed by `propagate`, so this is still a small worker-local problem.  It
-   * runs only every fourth new equation in a dedicated worker, avoiding both a
-   * general large-matrix decoder on every reply and a camera/UI main-thread stall.
+   * Normally, when at most 128 chunks remain, solve the already received repair
+   * equations with bounded GF(2) elimination. Exact rank tracking can safely
+   * trigger it earlier when the complete system has reached rank K: at that point
+   * waiting for more optical frames cannot add information. Equations have already
+   * had known chunks removed by `propagate`; elimination runs in a dedicated worker.
    */
-  private tryDenseTailSolve(): void {
+  private tryDenseTailSolve(rankComplete = false): void {
     if (this.isComplete) return
     const missing = this.k - this.decodedCount
-    if (missing > DENSE_TAIL_LIMIT || this.pending.size < missing || (++this.tailSolveTicks & DENSE_TAIL_RETRY_MASK) !== 0) return
+    const rankSolve = rankComplete && missing <= RANK_COMPLETE_SOLVE_LIMIT
+    if ((!rankSolve && missing > DENSE_TAIL_LIMIT) || this.pending.size < missing) return
+    if (!rankSolve && (++this.tailSolveTicks & DENSE_TAIL_RETRY_MASK) !== 0) return
     if (this.tailSolveInFlight) return
     this.denseTailAttempts++
     const rows: DenseTailRow[] = [...this.pending.values()].map(pending => ({

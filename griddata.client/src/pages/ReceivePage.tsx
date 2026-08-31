@@ -21,7 +21,9 @@ const { Title, Paragraph, Text } = Typography
 
 interface Snapshot {
   k: number
-  unique: number
+  unique: number       // fully reconstructed source chunks
+  rank: number         // innovative GF(2) equations (true transfer progress)
+  rankExact: boolean
   quality: number      // 0..1 rolling valid-scan rate
   speed: number        // KB/s instantaneous recovered-data rate
   averageSpeed: number // KB/s since first data frame
@@ -30,6 +32,63 @@ interface Snapshot {
   attempts: number
   scanRate: number     // camera scans processed per second
   combinedWins: number // frames recovered thanks to soft-combining ≥2 looks
+}
+
+interface TransferTimelineSample {
+  second: number
+  intervalSeconds: number
+  phase: 'search' | 'bootstrap' | 'payload' | 'complete'
+  manifestSeen: boolean
+  k: number
+  uniqueChunks: number
+  missingChunks: number
+  decodedChunksDelta: number
+  decodedKBps: number
+  innovativeRank: number
+  rankMissing: number
+  rankDelta: number
+  rankKBps: number
+  rankExact: boolean
+  equations: number
+  equationsDelta: number
+  equationRate: number
+  attempts: number
+  attemptsDelta: number
+  scanRate: number
+  validFrames: number
+  validFramesDelta: number
+  intervalValidRate: number
+  dataFrames: number
+  uniqueDataFrames: number
+  uniqueDataFramesDelta: number
+  duplicateDataFrames: number
+  duplicateDataFramesDelta: number
+  redundantDataFrames: number
+  redundantDataFramesDelta: number
+  manifestFrames: number
+  manifestFramesDelta: number
+  workerFramesProcessed: number
+  workerFramesDelta: number
+  decodeMs: number
+  averageDecodeMs: number
+  maxDecodeMs: number
+  workerPool: number
+  turboPairs: number
+  captureTargetFps: number
+  senderTimingFps: number
+  timingSkips: number
+  timingSkipsDelta: number
+  laneFrames: [number, number]
+  laneFramesDelta: [number, number]
+  quality: number
+  colorConfidence: number
+  spatialBlur: number
+  processingPixels: number
+  trackedFrames: number
+  combinedWins: number
+  tailSolverAttempts: number
+  tailSolverChunks: number
+  signals: string[]
 }
 
 interface Result_ {
@@ -42,10 +101,40 @@ interface Result_ {
   benchmark?: { seconds: number; goodputKBs: number; applicationGoodputKBs: number; validFrames: number; attempts: number; verified: boolean; report: string; calibration: OpticalCalibration | null }
 }
 
-const EMPTY: Snapshot = { k: 0, unique: 0, quality: 0, speed: 0, averageSpeed: 0, eta: -1, manifestSeen: false, attempts: 0, scanRate: 0, combinedWins: 0 }
+const EMPTY: Snapshot = { k: 0, unique: 0, rank: 0, rankExact: true, quality: 0, speed: 0, averageSpeed: 0, eta: -1, manifestSeen: false, attempts: 0, scanRate: 0, combinedWins: 0 }
 
 const ENC_LABEL: Record<Encoding, string> = {
   bw: 'أبيض وأسود', color8: '8 ألوان', color16: '16 لون', color32: '32 لون', color64: '64 لون',
+}
+
+function summarizeTransferTimeline(samples: TransferTimelineSample[]) {
+  const signalSeconds: Record<string, number> = {}
+  let longestNoDecodedSeconds = 0
+  let currentNoDecodedSeconds = 0
+  let longestNoRankSeconds = 0
+  let currentNoRankSeconds = 0
+  for (const sample of samples) {
+    for (const signal of sample.signals) signalSeconds[signal] = Number(((signalSeconds[signal] ?? 0) + sample.intervalSeconds).toFixed(3))
+    if (sample.phase === 'payload' && sample.decodedChunksDelta === 0) {
+      currentNoDecodedSeconds += sample.intervalSeconds
+      longestNoDecodedSeconds = Math.max(longestNoDecodedSeconds, currentNoDecodedSeconds)
+    } else currentNoDecodedSeconds = 0
+    if (sample.phase === 'payload' && sample.rankDelta === 0) {
+      currentNoRankSeconds += sample.intervalSeconds
+      longestNoRankSeconds = Math.max(longestNoRankSeconds, currentNoRankSeconds)
+    } else currentNoRankSeconds = 0
+  }
+  return {
+    samples: samples.length,
+    durationSeconds: samples.length ? samples[samples.length - 1].second : 0,
+    longestNoDecodedSeconds: Number(longestNoDecodedSeconds.toFixed(3)),
+    longestNoRankSeconds: Number(longestNoRankSeconds.toFixed(3)),
+    maxDecodeMs: samples.reduce((max, sample) => Math.max(max, sample.decodeMs), 0),
+    maxScanRate: samples.reduce((max, sample) => Math.max(max, sample.scanRate), 0),
+    maxDecodedKBps: samples.reduce((max, sample) => Math.max(max, sample.decodedKBps), 0),
+    maxRankKBps: samples.reduce((max, sample) => Math.max(max, sample.rankKBps), 0),
+    signalSeconds,
+  }
 }
 
 export default function ReceivePage() {
@@ -86,6 +175,8 @@ export default function ReceivePage() {
   const runRef = useRef({ firstValidAt: 0, firstDataAt: 0, validFrames: 0 })
   const pendingDataRef = useRef<ParsedFrame[]>([])
   const diagRef = useRef({ manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-' })
+  const timelineRef = useRef<TransferTimelineSample[]>([])
+  const timelineStartedAtRef = useRef(0)
   const [diag, setDiag] = useState({ manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-', ms: 0, wasm: false, webGpu: false, webGpuStatus: 'waiting' as 'waiting' | 'probing' | 'active' | 'unavailable' | 'rejected', webGpuReason: 'waiting for manifest', laneFrames: [0, 0] as [number, number], phase: 'search' as 'search' | 'bootstrap' | 'payload', colorConfidence: 0 })
 
   const reset = useCallback(() => {
@@ -102,6 +193,8 @@ export default function ReceivePage() {
     statsRef.current = { looks: 0, combinedWins: 0, superLooks: 0, superWins: 0, ms: 0, avgMs: 0, maxMs: 0, processed: 0, wasm: false, spatialSimd: false, webGpu: false, gpuSampleMs: 0, webGpuStatus: 'waiting', webGpuReason: 'waiting for manifest', workerPool: 0, turboPairs: 0, captureTargetFps: 0, timingFps: 0, timingSkips: 0, laneFrames: [0, 0], proc: 0, tracked: 0, phase: 'search', colorConfidence: 0, spatialBlur: 0, gpuCapture: false }
     runRef.current = { firstValidAt: 0, firstDataAt: 0, validFrames: 0 }
     diagRef.current = { manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-' }
+    timelineRef.current = []
+    timelineStartedAtRef.current = 0
     setSnap(EMPTY)
     setResult(null)
     setDetected(null)
@@ -110,8 +203,105 @@ export default function ReceivePage() {
     detectedRef.current = null
   }, [])
 
+  const recordTimelineSample = useCallback((complete = false) => {
+    const now = performance.now()
+    if (!timelineStartedAtRef.current) timelineStartedAtRef.current = now
+    const previous = timelineRef.current[timelineRef.current.length - 1]
+    const elapsed = Math.max(0, (now - timelineStartedAtRef.current) / 1000)
+    const intervalSeconds = Math.max(0.001, previous ? elapsed - previous.second : elapsed || 1)
+    const dec = decoderRef.current
+    const m = manifestRef.current
+    const stats = statsRef.current
+    const diag = diagRef.current
+    const uniqueChunks = dec?.uniqueChunks ?? 0
+    const innovativeRank = dec?.innovativeRank ?? 0
+    const equations = dec?.receivedEquations ?? 0
+    const attemptsDelta = attemptsRef.current - (previous?.attempts ?? 0)
+    const validFramesDelta = runRef.current.validFrames - (previous?.validFrames ?? 0)
+    const decodedChunksDelta = uniqueChunks - (previous?.uniqueChunks ?? 0)
+    const rankDelta = innovativeRank - (previous?.innovativeRank ?? 0)
+    const uniqueDataFramesDelta = diag.dataUnique - (previous?.uniqueDataFrames ?? 0)
+    const duplicateDataFramesDelta = diag.dataDuplicate - (previous?.duplicateDataFrames ?? 0)
+    const redundantDataFramesDelta = diag.dataRedundant - (previous?.redundantDataFrames ?? 0)
+    const manifestFramesDelta = diag.manifest - (previous?.manifestFrames ?? 0)
+    const workerFramesDelta = stats.processed - (previous?.workerFramesProcessed ?? 0)
+    const timingSkipsDelta = stats.timingSkips - (previous?.timingSkips ?? 0)
+    const laneFramesDelta: [number, number] = [
+      stats.laneFrames[0] - (previous?.laneFrames[0] ?? 0),
+      stats.laneFrames[1] - (previous?.laneFrames[1] ?? 0),
+    ]
+    const signals: string[] = []
+    if (previous) {
+      if (workerFramesDelta === 0 && attemptsDelta === 0) signals.push('capture-or-scheduler-stall')
+      if (attemptsDelta > 0 && validFramesDelta === 0) signals.push('optical-or-ldpc-failure')
+      if (timingSkipsDelta > 0 || duplicateDataFramesDelta > 0) signals.push('duplicate-or-phase-aliasing')
+      if (manifestFramesDelta > 0 && uniqueDataFramesDelta === 0) signals.push('manifest-overhead')
+      if (equations - (previous?.equations ?? 0) > 0 && decodedChunksDelta === 0) signals.push('fountain-accumulating')
+      if (equations - (previous?.equations ?? 0) > 0 && rankDelta === 0) signals.push('rank-stall-dependent-equations')
+      if (decodedChunksDelta > Math.max(2, equations - (previous?.equations ?? 0))) signals.push('fountain-release-burst')
+      if (stats.timingFps > 0 && stats.captureTargetFps + 0.5 < stats.timingFps) signals.push('receiver-processing-throttle')
+    }
+    timelineRef.current.push({
+      second: Number(elapsed.toFixed(3)),
+      intervalSeconds: Number(intervalSeconds.toFixed(3)),
+      phase: complete ? 'complete' : stats.phase,
+      manifestSeen: !!m,
+      k: m?.k ?? 0,
+      uniqueChunks,
+      missingChunks: Math.max(0, (m?.k ?? 0) - uniqueChunks),
+      decodedChunksDelta,
+      decodedKBps: Number((decodedChunksDelta * (m?.chunk ?? 0) / 1024 / intervalSeconds).toFixed(3)),
+      innovativeRank,
+      rankMissing: Math.max(0, (m?.k ?? 0) - innovativeRank),
+      rankDelta,
+      rankKBps: Number((rankDelta * (m?.chunk ?? 0) / 1024 / intervalSeconds).toFixed(3)),
+      rankExact: dec?.rankIsExact ?? true,
+      equations,
+      equationsDelta: equations - (previous?.equations ?? 0),
+      equationRate: Number(((equations - (previous?.equations ?? 0)) / intervalSeconds).toFixed(3)),
+      attempts: attemptsRef.current,
+      attemptsDelta,
+      scanRate: Number((attemptsDelta / intervalSeconds).toFixed(3)),
+      validFrames: runRef.current.validFrames,
+      validFramesDelta,
+      intervalValidRate: Number((validFramesDelta / Math.max(1, attemptsDelta)).toFixed(3)),
+      dataFrames: diag.data,
+      uniqueDataFrames: diag.dataUnique,
+      uniqueDataFramesDelta,
+      duplicateDataFrames: diag.dataDuplicate,
+      duplicateDataFramesDelta,
+      redundantDataFrames: diag.dataRedundant,
+      redundantDataFramesDelta,
+      manifestFrames: diag.manifest,
+      manifestFramesDelta,
+      workerFramesProcessed: stats.processed,
+      workerFramesDelta,
+      decodeMs: Number(stats.ms.toFixed(2)),
+      averageDecodeMs: Number(stats.avgMs.toFixed(2)),
+      maxDecodeMs: Number(stats.maxMs.toFixed(2)),
+      workerPool: stats.workerPool,
+      turboPairs: stats.turboPairs,
+      captureTargetFps: Number(stats.captureTargetFps.toFixed(2)),
+      senderTimingFps: Number(stats.timingFps.toFixed(2)),
+      timingSkips: stats.timingSkips,
+      timingSkipsDelta,
+      laneFrames: [...stats.laneFrames],
+      laneFramesDelta,
+      quality: Number(Math.min(1, qualityRef.current * 10).toFixed(3)),
+      colorConfidence: Number(stats.colorConfidence.toFixed(3)),
+      spatialBlur: Number(stats.spatialBlur.toFixed(3)),
+      processingPixels: stats.proc,
+      trackedFrames: stats.tracked,
+      combinedWins: stats.combinedWins,
+      tailSolverAttempts: dec?.tailSolverAttempts ?? 0,
+      tailSolverChunks: dec?.tailSolverChunks ?? 0,
+      signals,
+    })
+  }, [])
+
   const present = useCallback((kind: 'file' | 'text', name: string, mime: string, bytes: Uint8Array, verified = false, manifest: TransferManifest | null = manifestRef.current) => {
-      doneRef.current = true
+    doneRef.current = true
+    recordTimelineSample(true)
     playChannelTone('complete', soundEnabledRef.current)
     const started = runRef.current.firstDataAt || runRef.current.firstValidAt
     const seconds = started ? (performance.now() - started) / 1000 : 0
@@ -192,8 +382,11 @@ export default function ReceivePage() {
           superResWins: statsRef.current.superWins,
         },
         fountain: decoderRef.current ? {
-          repairProfile: manifest?.v && manifest.v >= 9 ? '8:1-mixed-packed128' : manifest?.v === 8 ? '4:1-wide-packed128' : 'legacy',
+          repairProfile: manifest?.v && manifest.v >= 10 ? '1:1-balanced-mixed-packed128' : manifest?.v === 9 ? '8:1-mixed-packed128' : manifest?.v === 8 ? '4:1-wide-packed128' : 'legacy',
           receivedEquations: decoderRef.current.receivedEquations,
+          innovativeRank: decoderRef.current.innovativeRank,
+          rankExact: decoderRef.current.rankIsExact,
+          dependentEquations: decoderRef.current.dependentEquations,
           tailSolverAttempts: decoderRef.current.tailSolverAttempts,
           tailSolverChunks: decoderRef.current.tailSolverChunks,
           tailSolverMs: Number(decoderRef.current.tailSolverMs.toFixed(2)),
@@ -201,6 +394,9 @@ export default function ReceivePage() {
         calibration,
         counters: diagRef.current,
         detected: detectedRef.current,
+        timelineSamplingSeconds: 1,
+        timelineSummary: summarizeTransferTimeline(timelineRef.current),
+        timeline: timelineRef.current,
       }, null, 2),
     }
     // Keep the receipt on the receiver itself. No sender/server connection is
@@ -213,7 +409,7 @@ export default function ReceivePage() {
       const url = URL.createObjectURL(new Blob([bytes], { type: mime }))
       setResult({ name, mime, kind, bytes, url, benchmark })
     }
-  }, [])
+  }, [recordTimelineSample])
 
   const finish = useCallback(async () => {
     const m = manifestRef.current
@@ -320,7 +516,7 @@ export default function ReceivePage() {
    
     if (!active) return
     let lastAttempts = attemptsRef.current
-    let lastUnique = decoderRef.current?.uniqueChunks ?? 0
+    let lastRank = decoderRef.current?.innovativeRank ?? 0
     let lastTs = performance.now()
     let lastSpeedEpoch = speedEpochRef.current
     let rollingSpeed = 0
@@ -328,29 +524,30 @@ export default function ReceivePage() {
       const dec = decoderRef.current
       const m = manifestRef.current
       const unique = dec?.uniqueChunks ?? 0
+      const rank = dec?.innovativeRank ?? 0
       const k = m?.k ?? 0
       const now = performance.now()
       if (lastSpeedEpoch !== speedEpochRef.current) {
         lastSpeedEpoch = speedEpochRef.current
-        lastUnique = unique
+        lastRank = rank
         lastTs = now
         rollingSpeed = 0
       }
       const elapsed = startRef.current ? (performance.now() - startRef.current) / 1000 : 0
-      const bytes = unique * (m?.chunk ?? 0)
-      // Fountain elimination can release several already-received source chunks
-      // at once. That is a real user-visible progress burst, but it is distinct
-      // from the whole-transfer goodput shown alongside it in the overlay.
+      const bytes = rank * (m?.chunk ?? 0)
+      // Rank grows when a mathematically independent equation arrives, even if
+      // peeling has not released its source chunks yet. This is the true smooth
+      // channel progress; decoded chunks remain visible as a secondary counter.
       const averageSpeed = elapsed > 3 ? bytes / 1024 / elapsed : 0
       const intervalSeconds = Math.max(0.001, (now - lastTs) / 1000)
-      const instantSpeed = (unique - lastUnique) * (m?.chunk ?? 0) / 1024 / intervalSeconds
+      const instantSpeed = (rank - lastRank) * (m?.chunk ?? 0) / 1024 / intervalSeconds
       rollingSpeed = instantSpeed > 0 ? rollingSpeed * 0.55 + instantSpeed * 0.45 : rollingSpeed * 0.82
       const rate = (averageSpeed * 1024) / Math.max(1, m?.chunk ?? 1)
-      const eta = rate > 0 && k > 0 ? Math.max(0, (k - unique) / rate) : -1
+      const eta = rate > 0 && k > 0 ? Math.max(0, (k - rank) / rate) : -1
       const scanRate = (attemptsRef.current - lastAttempts) / intervalSeconds
-      lastAttempts = attemptsRef.current; lastTs = now; lastUnique = unique
+      lastAttempts = attemptsRef.current; lastTs = now; lastRank = rank
       setSnap({
-        k, unique,
+        k, unique, rank, rankExact: dec?.rankIsExact ?? true,
         quality: Math.min(1, qualityRef.current * 10), // EMA scaled back to 0..1
         speed: rollingSpeed, averageSpeed, eta,
         manifestSeen: !!m,
@@ -363,7 +560,17 @@ export default function ReceivePage() {
     return () => clearInterval(id)
   }, [active])
 
-  const pct = snap.k > 0 ? Math.round((snap.unique / snap.k) * 100) : 0
+  // Preserve a full second-by-second history separately from the faster UI
+  // refresh. This timeline is embedded in the locally saved completion report.
+  useEffect(() => {
+    if (!active) return
+    if (!timelineStartedAtRef.current) timelineStartedAtRef.current = performance.now()
+    recordTimelineSample()
+    const id = window.setInterval(() => recordTimelineSample(), 1000)
+    return () => clearInterval(id)
+  }, [active, recordTimelineSample])
+
+  const pct = snap.k > 0 ? Math.round((snap.rank / snap.k) * 100) : 0
   if (result) {
     return (
       <div style={{ maxWidth: 640, margin: '0 auto' }}>
@@ -469,7 +676,7 @@ export default function ReceivePage() {
             {!diag.webGpu && diag.webGpuStatus === 'probing' && <Tag color="geekblue" title={diag.webGpuReason} style={{ margin: 0, fontSize: 11 }}>WebGPU فحص</Tag>}
             {!diag.webGpu && (diag.webGpuStatus === 'unavailable' || diag.webGpuStatus === 'rejected') && <Tag color="orange" title={diag.webGpuReason} style={{ margin: 0, fontSize: 11 }}>CPU · WebGPU غير فعّال</Tag>}
             {tileCount === 2 && <Tag color="blue" style={{ margin: 0, fontSize: 11 }}>L1 {diag.laneFrames[0]} · L2 {diag.laneFrames[1]}</Tag>}
-            {snap.unique > 0 && <Tag color="success" style={{ margin: 0, fontSize: 11 }}>نقل فعّال</Tag>}
+            {snap.rank > 0 && <Tag color="success" style={{ margin: 0, fontSize: 11 }}>نقل فعّال</Tag>}
             {detected && <Tag color={diag.phase === 'payload' ? 'cyan' : 'gold'} style={{ margin: 0, fontSize: 11 }}>
               {diag.phase === 'payload' ? 'CV Lock' : 'تتبّع مبدئي'}
             </Tag>}
@@ -490,11 +697,11 @@ export default function ReceivePage() {
               style={{ marginBottom: 2 }}
             />
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11, color: 'rgba(255,255,255,0.85)', gap: 6 }}>
-              <span>{snap.unique}{snap.k ? `/${snap.k}` : ''}</span>
+              <span title="الرتبة المستقلة / القطع المحلولة">رتبة {snap.rank}{snap.k ? `/${snap.k}` : ''} · محلول {snap.unique}</span>
               <span title="Instant recovery speed / whole-transfer goodput">{snap.speed > 0 ? `لحظي ${snap.speed.toFixed(1)} · كلي ${snap.averageSpeed.toFixed(1)} KB/s` : '…'}</span>
               <span>{Math.round(snap.scanRate)} fps</span>
-              <Tag title="نسبة لقطات الكاميرا التي اجتازت CRC/LDPC، وليست جودة الصورة" color={snap.unique > 0 ? 'success' : qualityColor(snap.quality)} style={{ margin: 0, fontSize: 10, lineHeight: '16px', padding: '0 4px' }}>
-                {snap.unique > 0 ? 'يستقبل' : `${Math.round(snap.quality * 100)}٪`}
+              <Tag title="نسبة لقطات الكاميرا التي اجتازت CRC/LDPC، وليست جودة الصورة" color={snap.rank > 0 ? 'success' : qualityColor(snap.quality)} style={{ margin: 0, fontSize: 10, lineHeight: '16px', padding: '0 4px' }}>
+                {snap.rank > 0 ? (snap.rankExact ? 'رتبة دقيقة' : 'رتبة تقديرية') : `${Math.round(snap.quality * 100)}٪`}
               </Tag>
               <span title={detected?.enc === 'bw' ? 'ثبات عينات الأبيض/الأسود' : 'متوسط ثقة لون الخلايا'} style={{ fontSize: 10, color: 'rgba(255,255,255,0.75)' }}>
                 {Math.round(diag.colorConfidence * 100)}% {detected?.enc === 'bw' ? 'إشارة' : 'لون'}

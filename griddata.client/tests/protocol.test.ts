@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { decodeBarcodeRow, decodeTimingBarcodeRow, encodeBarcodeRow, encodeTimingBarcodeRow } from '../src/services/metaBarcode.ts'
 import { FountainDecoder } from '../src/services/fountainDecoder.ts'
 import { indicesForSeed } from '../src/services/fountainDecoder.ts'
-import { buildTransfer, decodeManifestWire, encodeManifestFrames, encodeManifestWire, finishTransfer, fountainEncode, FRAME_TYPE_DATA, maxPayload, packFrameLdpc, parseFrameLdpcSoft, seedForDataIndex, type TransferManifest } from '../src/services/transferCodec.ts'
+import { buildTransfer, decodeManifestWire, encodeManifestFrames, encodeManifestWire, finishTransfer, fountainEncode, FRAME_TYPE_DATA, maxPayload, packFrameLdpc, parseFrameLdpcSoft, seedForBalancedDataIndex, seedForDataIndex, type TransferManifest } from '../src/services/transferCodec.ts'
 import { capacityBytes, encodeCellsRGB, equalizeSpatialReadings, softDemodLLR, type EncodingSpec } from '../src/services/visualCodec.ts'
 import { encodeHierarchicalCells, hierarchicalLayout, hierarchicalSeeds, softDemodHierarchical } from '../src/services/hierarchicalCodec.ts'
 import { estimateSubpixelShift, fuseLooks } from '../src/services/superReceiver.ts'
@@ -83,7 +83,7 @@ test('Fast 72x72 raises payload capacity while preserving exact barcode geometry
   assert.equal(decoded?.lanes, 2)
 })
 
-test('Fast 72x72 completes a clean end-to-end v9 transfer', async () => {
+test('Fast 72x72 completes a clean end-to-end v10 transfer', async () => {
   const spec: EncodingSpec = { enc: 'color8', gridW: 72, gridH: 72, rate: 0.625 }
   const raw = new Uint8Array(18_000)
   let state = 0x12345678
@@ -94,7 +94,7 @@ test('Fast 72x72 completes a clean end-to-end v9 transfer', async () => {
   const built = await buildTransfer(raw, { kind: 'file', name: 'fast72.bin', mime: 'application/octet-stream' }, {
     spec, chunkSize: maxPayload(spec), frameCount: 1, fps: 12, lanes: 2, systematicRun: 8,
   })
-  assert.equal(built.manifest.v, 9)
+  assert.equal(built.manifest.v, 10)
   assert.equal(built.manifest.chunk, 1151)
   const decoder = new FountainDecoder(built.manifest.k, built.manifest.chunk, true, 2)
   const capacity = capacityBytes(spec)
@@ -331,6 +331,51 @@ test('Fast 8-direct fountain cadence reconstructs with interleaved repair frames
   assert.deepEqual([...decoder.reconstruct()], [...chunks.flatMap(part => [...part])])
 })
 
+test('v10 balanced carousel distributes direct chunks through the entire 2K pool', () => {
+  const k = 53
+  const seeds = Array.from({ length: k * 2 }, (_, index) => seedForBalancedDataIndex(index, k))
+  assert.deepEqual(seeds.slice(0, 8), [1, 54, 55, 2, 3, 56, 57, 4])
+  assert.deepEqual(seeds.slice(-6), [51, 104, 105, 52, 53, 106])
+  assert.equal(new Set(seeds.slice(0, k * 2).filter(seed => seed <= k)).size, k)
+  assert.equal(new Set(seeds).size, k * 2)
+  const lane0Direct = seeds.filter((seed, index) => index % 2 === 0 && seed <= k).length
+  const lane1Direct = seeds.filter((seed, index) => index % 2 === 1 && seed <= k).length
+  assert.ok(Math.abs(lane0Direct - lane1Direct) <= 1)
+})
+
+test('v10 balanced carousel reconstructs under deterministic paired loss without a repair-only tail', () => {
+  const k = 362, chunk = 1
+  const chunks = Array.from({ length: k }, () => new Uint8Array(1))
+  const decoder = new FountainDecoder(k, chunk, true, 2)
+  const lastDirectAt = Array.from({ length: k * 2 }, (_, index) => seedForBalancedDataIndex(index, k))
+    .reduce((last, seed, index) => seed <= k ? index : last, -1)
+  for (let dataIndex = 0; dataIndex < k * 3 && !decoder.isComplete; dataIndex++) {
+    const seed = seedForBalancedDataIndex(dataIndex, k)
+    // Reproduce paired optical loss plus a sparse independent decode failure.
+    const senderTick = Math.floor(dataIndex / 2)
+    if (senderTick % 23 === 22 || (dataIndex * 17 + 13) % 100 < 10) continue
+    decoder.addFrame(seed, fountainEncode(chunks, seed, chunk, 2))
+  }
+  assert.equal(lastDirectAt, k * 2 - 2 + ((k - 1) & 1))
+  assert.equal(decoder.isComplete, true)
+  assert.equal(decoder.rankIsExact, true)
+  assert.equal(decoder.innovativeRank, k)
+})
+
+test('exact rank K triggers dense completion above the legacy 128-chunk tail limit', () => {
+  const k = 160, chunk = 1
+  const chunks = Array.from({ length: k }, (_, index) => Uint8Array.of(index & 0xff))
+  const decoder = new FountainDecoder(k, chunk, true, 2)
+  for (let repair = 1; repair <= k * 8 && !decoder.isComplete; repair++) {
+    const seed = k + repair
+    decoder.addFrame(seed, fountainEncode(chunks, seed, chunk, 2))
+  }
+  assert.equal(decoder.rankIsExact, true)
+  assert.equal(decoder.innovativeRank, k)
+  assert.equal(decoder.isComplete, true)
+  assert.deepEqual([...decoder.reconstruct()], [...chunks.flatMap(part => [...part])])
+})
+
 test('bounded dense tail solver closes entangled repair equations', () => {
   const k = 40, chunk = 4
   const chunks = Array.from({ length: k }, (_, i) => Uint8Array.from([i, i ^ 0x21, i ^ 0x8e, i ^ 0xf0]))
@@ -438,6 +483,20 @@ test('v9 compact manifest selects the field-proven mixed repair protocol', () =>
   assert.deepEqual(
     Array.from({ length: 10 }, (_, index) => seedForDataIndex(index, manifest.k, 8)),
     [1, 2, 3, 4, 5, 6, 7, 8, 462, 9],
+  )
+})
+
+test('v10 compact manifest selects the balanced full-carousel schedule', () => {
+  const manifest: TransferManifest = {
+    v: 10, id: 46, kind: 'file', name: 'sample.pdf', mime: 'application/pdf',
+    total: 416638, comp: 415620, compressed: true, sha256: 'f'.repeat(64),
+    k: 362, chunk: 1151, enc: 'color8', gridW: 72, gridH: 72, rate: 0.625, fps: 12,
+  }
+  const wire = encodeManifestWire(manifest)
+  assert.deepEqual(decodeManifestWire(wire, { enc: 'color8', gridW: 72, gridH: 72, rate: 0.625 }), manifest)
+  assert.deepEqual(
+    Array.from({ length: 8 }, (_, index) => seedForBalancedDataIndex(index, manifest.k)),
+    [1, 363, 364, 2, 3, 365, 366, 4],
   )
 })
 
