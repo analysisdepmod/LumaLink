@@ -76,18 +76,38 @@ void nativeDecodeWorkerEntry(SendPort parent) {
         vPixelStride: message['vPixelStride'] as int,
       );
       final replies = <Map<String, Object?>>[];
+      final outers = locateOuterFrames(frame.luma, maxCount: 2);
       var locked = false;
-      for (final (visualIndex, outer) in locateOuterFrames(
-        frame.luma,
-        maxCount: 2,
-      ).indexed) {
+      var freshBarcodes = 0;
+      var fallbackBarcodes = 0;
+      var timingRows = 0;
+      var sampledFrames = 0;
+      var decodedFrames = 0;
+      var decodedManifest = 0;
+      var decodedData = 0;
+      var duplicateFrames = 0;
+      final indexedOuters = outers.indexed.toList(growable: false);
+      final refinedOuters = indexedOuters
+          .where((entry) => entry.$2.refined)
+          .toList(growable: false);
+      final decodeTargets = refinedOuters.isNotEmpty
+          ? refinedOuters
+          : indexedOuters.take(1);
+      for (final (visualIndex, outer) in decodeTargets) {
         final found = locateBarcode(frame.luma, outer);
         final barcode = found ?? known[visualIndex];
         if (barcode == null || barcode.gridWidth == 0) continue;
+        if (found != null) {
+          freshBarcodes++;
+        } else {
+          fallbackBarcodes++;
+        }
         locked = true;
         final timing = locateTimingBarcode(frame.luma, outer, barcode);
+        if (timing != null) timingRows++;
         final lane = timing?.lane ?? visualIndex.clamp(0, 1);
         if (timing != null && lastTicks[lane] == timing.tick) {
+          duplicateFrames++;
           replies.add(<String, Object?>{
             'lane': lane,
             'tick': timing.tick,
@@ -97,6 +117,7 @@ void nativeDecodeWorkerEntry(SendPort parent) {
           });
           continue;
         }
+        sampledFrames++;
         final sampled = sampleColor8(frame, outer, barcode);
         final capacity = switch (barcode.encoding) {
           GridEncoding.bw => bwCapacityBytes(
@@ -123,6 +144,11 @@ void nativeDecodeWorkerEntry(SendPort parent) {
               ? 12
               : 16,
         );
+        if (decoded != null) {
+          decodedFrames++;
+          if (decoded.type == frameManifest) decodedManifest++;
+          if (decoded.type == frameData) decodedData++;
+        }
         replies.add(<String, Object?>{
           'lane': lane,
           if (timing != null) 'tick': timing.tick,
@@ -142,6 +168,22 @@ void nativeDecodeWorkerEntry(SendPort parent) {
         'ms': watch.elapsedMicroseconds / 1000,
         'locked': locked,
         'results': replies,
+        'diagnostic': <String, Object?>{
+          'image': '${frame.width}x${frame.height}',
+          'strides':
+              '${frame.yRowStride}/${frame.uRowStride}/${frame.vRowStride}',
+          'outers': outers.length,
+          'finderRefined': outers.where((outer) => outer.refined).length,
+          'freshBarcodes': freshBarcodes,
+          'fallbackBarcodes': fallbackBarcodes,
+          'timingRows': timingRows,
+          'sampled': sampledFrames,
+          'decoded': decodedFrames,
+          'manifest': decodedManifest,
+          'data': decodedData,
+          'duplicates': duplicateFrames,
+          'uvOrder': 'YUV',
+        },
       });
     } catch (error) {
       watch.stop();
@@ -151,6 +193,7 @@ void nativeDecodeWorkerEntry(SendPort parent) {
         'locked': false,
         'results': const <Object?>[],
         'error': error.toString(),
+        'diagnostic': const <String, Object?>{'workerException': true},
       });
     }
   });

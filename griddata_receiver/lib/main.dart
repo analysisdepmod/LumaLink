@@ -1,10 +1,14 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:developer' as developer;
+import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'native_decode_worker.dart';
 import 'protocol/frame_codec.dart';
@@ -70,6 +74,9 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   Isolate? _decodeIsolate;
   int _decodeRequestId = 0;
   String? _decoderError;
+  DateTime _lastDiagnosticLog = DateTime.fromMillisecondsSinceEpoch(0);
+  File? _diagnosticFile;
+  bool _diagnosticWritePending = false;
 
   @override
   void initState() {
@@ -88,6 +95,31 @@ class _ReceiverScreenState extends State<ReceiverScreen>
     );
   }
 
+  Future<void> _persistDiagnostic(String line) async {
+    if (_diagnosticWritePending) return;
+    _diagnosticWritePending = true;
+    try {
+      final file = _diagnosticFile ??= File(
+        '${(await getExternalStorageDirectory() ?? await getApplicationDocumentsDirectory()).path}${Platform.pathSeparator}lumalink-receiver.jsonl',
+      );
+      if (await file.exists() && await file.length() > 4 * 1024 * 1024) {
+        final previous = File('${file.path}.previous');
+        if (await previous.exists()) await previous.delete();
+        await file.rename(previous.path);
+        _diagnosticFile = File(file.path);
+      }
+      await _diagnosticFile!.writeAsString(
+        '${DateTime.now().toIso8601String()} $line\n',
+        mode: FileMode.append,
+        flush: false,
+      );
+    } catch (_) {
+      // Diagnostics must never interrupt the optical receiver.
+    } finally {
+      _diagnosticWritePending = false;
+    }
+  }
+
   Future<void> _openCamera() async {
     final rear = widget.cameras.where(
       (camera) => camera.lensDirection == CameraLensDirection.back,
@@ -101,7 +133,7 @@ class _ReceiverScreenState extends State<ReceiverScreen>
     }
     final controller = CameraController(
       description,
-      ResolutionPreset.high,
+      ResolutionPreset.veryHigh,
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
@@ -196,6 +228,35 @@ class _ReceiverScreenState extends State<ReceiverScreen>
         barcode,
       );
     }
+    final now = DateTime.now();
+    if (now.difference(_lastDiagnosticLog).inMilliseconds >= 1000) {
+      _lastDiagnosticLog = now;
+      final diagnosticLine = jsonEncode(<String, Object?>{
+        'request': message['id'],
+        'decodeMs': _decodeMs,
+        'locked': message['locked'] == true,
+        'worker': message['diagnostic'],
+        'resultCount': results.length,
+        'validFrames': _validFrames,
+        'manifestAccepted': _manifest != null,
+        'pendingData': _pendingData.length,
+        'fountain': _fountain == null
+            ? null
+            : '${_fountain!.uniqueChunks}/${_manifest!.k} chunks, ${_fountain!.receivedEquations} equations',
+        'senderFps': _senderFps,
+        'knownBarcodes': _barcodes
+            .map(
+              (value) => value == null
+                  ? null
+                  : '${value.encoding.name}:${value.gridWidth}x${value.gridHeight}@${value.rate}',
+            )
+            .toList(),
+        if (workerError is String) 'error': workerError,
+      });
+      developer.log(diagnosticLine, name: 'LumaLinkRx');
+      debugPrint('LumaLinkRx $diagnosticLine');
+      unawaited(_persistDiagnostic(diagnosticLine));
+    }
     if (mounted && _manifest == null) {
       setState(
         () => _state = message['locked'] == true
@@ -212,6 +273,30 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       final manifest = _manifestAssembler.add(frame.payload, optical: barcode);
       if (manifest == null || _manifest?.id == manifest.id) return;
       _manifest = manifest;
+      developer.log(
+        jsonEncode(<String, Object?>{
+          'event': 'manifest-accepted',
+          'version': manifest.version,
+          'name': manifest.name,
+          'k': manifest.k,
+          'chunk': manifest.chunkSize,
+        }),
+        name: 'LumaLinkRx',
+      );
+      debugPrint(
+        'LumaLinkRx manifest accepted: v${manifest.version} ${manifest.name} K=${manifest.k}',
+      );
+      unawaited(
+        _persistDiagnostic(
+          jsonEncode(<String, Object?>{
+            'event': 'manifest-accepted',
+            'version': manifest.version,
+            'name': manifest.name,
+            'k': manifest.k,
+            'chunk': manifest.chunkSize,
+          }),
+        ),
+      );
       _fountain = FountainDecoder(
         manifest.k,
         manifest.chunkSize,
