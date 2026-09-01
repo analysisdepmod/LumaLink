@@ -64,6 +64,22 @@ int _degree(double random, int k) {
 }
 
 List<int> sourceIndices(int seed, int k, {int mediumWideEvery = 2}) {
+  if ((seed & 0x80000000) != 0) {
+    final pivot = (seed & 0x7fffffff) - 1;
+    if (pivot < 0 || pivot >= k) return const <int>[];
+    if (pivot == 0) return const <int>[0];
+    final random = _FountainRandom(_u32(seed ^ k ^ 0x11a7c0de));
+    final priorCount = math.min(3, pivot);
+    final seen = <int>{};
+    final result = <int>[];
+    while (result.length < priorCount) {
+      var index = (random.nextDouble() * pivot).floor();
+      if (index >= pivot) index = pivot - 1;
+      if (seen.add(index)) result.add(index);
+    }
+    result.add(pivot);
+    return result;
+  }
   if (seed >= 1 && seed <= k) return <int>[seed - 1];
   final random = _FountainRandom(seed & _u32Mask);
   final repairOrdinal = seed - k;
@@ -153,8 +169,9 @@ class FountainDecoder {
     ];
     if (missing.length > 128 ||
         _pending.length < missing.length ||
-        (++_tailTicks & 3) != 0)
+        (++_tailTicks & 3) != 0) {
       return;
+    }
     tailSolverAttempts++;
     final position = <int, int>{
       for (var i = 0; i < missing.length; i++) missing[i]: i,
@@ -195,8 +212,9 @@ class FountainDecoder {
       }
       for (var row = 0; row < masks.length; row++) {
         if (row == pivotRow ||
-            (masks[row] & (BigInt.one << column)) == BigInt.zero)
+            (masks[row] & (BigInt.one << column)) == BigInt.zero) {
           continue;
+        }
         masks[row] ^= masks[pivotRow];
         _xor(values[row], values[pivotRow]);
       }

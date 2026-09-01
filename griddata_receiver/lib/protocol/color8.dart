@@ -117,7 +117,9 @@ class Color8SpatialEqualizer {
       high = math.max(high, source[i]);
       output[i] = source[i];
     }
-    for (var i = 0; i < from; i++) output[i] = source[i];
+    for (var i = 0; i < from; i++) {
+      output[i] = source[i];
+    }
     final padding = math.max(4, (high - low) * 0.08);
     final minimum = low - padding, maximum = high + padding;
     final spill = math.min(0.49, strength * 1.6);
@@ -184,6 +186,54 @@ class Color8SpatialEqualizer {
 int color8CapacityBytes(int gridWidth, int gridHeight) {
   final usableCells = gridWidth * gridHeight - gridWidth * barcodeRows;
   return (usableCells * 3) ~/ 8;
+}
+
+List<int> segmentedColor8Capacities(int gridWidth, int gridHeight) {
+  final dataRows = math.max(0, gridHeight - barcodeRows);
+  final left = (gridWidth + 1) ~/ 2;
+  final right = gridWidth ~/ 2;
+  final top = (dataRows + 1) ~/ 2;
+  final bottom = dataRows ~/ 2;
+  return <int>[
+    left * top,
+    right * top,
+    left * bottom,
+    right * bottom,
+  ].map((cells) => cells * 3 ~/ 8).toList(growable: false);
+}
+
+int _color8Segment(int x, int y, int gridWidth, int gridHeight) {
+  final topRows = (gridHeight - barcodeRows + 1) ~/ 2;
+  return (y - barcodeRows < topRows ? 0 : 2) +
+      (x < (gridWidth + 1) ~/ 2 ? 0 : 1);
+}
+
+List<Float64List> splitSegmentedColor8Llr(
+  Float64List llr,
+  int gridWidth,
+  int gridHeight,
+) {
+  final capacities = segmentedColor8Capacities(gridWidth, gridHeight);
+  final output = capacities
+      .map((capacity) => Float64List(capacity * 8))
+      .toList(growable: false);
+  final cursors = <int>[0, 0, 0, 0];
+  for (var y = barcodeRows; y < gridHeight; y++) {
+    for (var x = 0; x < gridWidth; x++) {
+      final segment = _color8Segment(x, y, gridWidth, gridHeight);
+      final source = ((y - barcodeRows) * gridWidth + x) * 3;
+      final destination = cursors[segment];
+      for (
+        var channel = 0;
+        channel < 3 && destination + channel < output[segment].length;
+        channel++
+      ) {
+        output[segment][destination + channel] = llr[source + channel];
+      }
+      cursors[segment] += 3;
+    }
+  }
+  return output;
 }
 
 int bwCapacityBytes(int gridWidth, int gridHeight) =>
@@ -295,8 +345,9 @@ Float64List softDemodulateBw(Color8Grid grid) {
 /// Color8 cells, retaining the barcode region for the caller to paint separately.
 Color8Grid encodeColor8Cells(Uint8List frame, int gridWidth, int gridHeight) {
   final capacity = color8CapacityBytes(gridWidth, gridHeight);
-  if (frame.length != capacity)
+  if (frame.length != capacity) {
     throw ArgumentError('Frame does not match Color8 capacity');
+  }
   final cells = gridWidth * gridHeight;
   final red = Float32List(cells);
   final green = Float32List(cells);
@@ -318,6 +369,52 @@ Color8Grid encodeColor8Cells(Uint8List frame, int gridWidth, int gridHeight) {
     red[cell] = readBit();
     green[cell] = readBit();
     blue[cell] = readBit();
+  }
+  return Color8Grid(
+    gridWidth: gridWidth,
+    gridHeight: gridHeight,
+    red: red,
+    green: green,
+    blue: blue,
+    reliability: reliability,
+  );
+}
+
+/// Test/diagnostic mirror of the web v11 quadrant mapper.
+Color8Grid encodeSegmentedColor8Cells(
+  List<Uint8List> frames,
+  int gridWidth,
+  int gridHeight,
+) {
+  final capacities = segmentedColor8Capacities(gridWidth, gridHeight);
+  if (frames.length != 4) {
+    throw ArgumentError('Four segment frames are required');
+  }
+  for (var segment = 0; segment < 4; segment++) {
+    if (frames[segment].length != capacities[segment]) {
+      throw ArgumentError('Segment $segment does not match its capacity');
+    }
+  }
+  final cells = gridWidth * gridHeight;
+  final red = Float32List(cells);
+  final green = Float32List(cells);
+  final blue = Float32List(cells);
+  final reliability = Float32List(cells)..fillRange(0, cells, 1);
+  final cursors = <int>[0, 0, 0, 0];
+  double read(int segment) {
+    final bit = cursors[segment]++;
+    if (bit >= frames[segment].length * 8) return 0;
+    return ((frames[segment][bit ~/ 8] >> (7 - (bit % 8))) & 1) == 1 ? 255 : 0;
+  }
+
+  for (var y = barcodeRows; y < gridHeight; y++) {
+    for (var x = 0; x < gridWidth; x++) {
+      final segment = _color8Segment(x, y, gridWidth, gridHeight);
+      final cell = y * gridWidth + x;
+      red[cell] = read(segment);
+      green[cell] = read(segment);
+      blue[cell] = read(segment);
+    }
   }
   return Color8Grid(
     gridWidth: gridWidth,

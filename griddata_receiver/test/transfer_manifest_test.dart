@@ -64,7 +64,9 @@ void main() {
     offset += 4;
     view.setUint16(offset, 1151, Endian.little);
     offset += 2;
-    for (var i = 0; i < 32; i++) wire[offset++] = i;
+    for (var i = 0; i < 32; i++) {
+      wire[offset++] = i;
+    }
     view.setUint16(offset, name.length, Endian.little);
     offset += 2;
     view.setUint16(offset, mime.length, Endian.little);
@@ -87,5 +89,22 @@ void main() {
     expect(manifest?.chunkSize, 1151);
     expect(manifest?.gridWidth, 72);
     expect(manifest?.senderFps, 12);
+
+    wire[3] = 11;
+    view.setUint16(23, 273, Endian.little);
+    final v11 = ManifestAssembler().add(
+      Uint8List.fromList([0, 1, ...wire]),
+      optical: const BarcodeData(
+        version: 3,
+        encoding: GridEncoding.color8,
+        rate: 0.625,
+        zones: false,
+        gridWidth: 72,
+        gridHeight: 72,
+        lanes: 6,
+      ),
+    );
+    expect(v11?.version, 11);
+    expect(v11?.chunkSize, 273);
   });
 }

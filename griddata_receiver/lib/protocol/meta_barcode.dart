@@ -74,8 +74,17 @@ List<int> _pattern(BarcodeData data) {
   final encoding = GridEncoding.values.indexOf(data.encoding);
   final widthRaw = (data.gridWidth / 8).round().clamp(0, 32);
   final packedWidth = widthRaw == 32 ? 0 : widthRaw;
+  final laneCode = data.lanes == 6
+      ? 3
+      : data.lanes == 4
+      ? 2
+      : data.lanes == 2
+      ? 1
+      : 0;
   final aux = data.zones
       ? data.ringWidth
+      : data.version >= 3
+      ? (laneCode << 4) | (widthRaw & 0x0f)
       : packedWidth | (data.lanes == 2 ? 0x20 : 0);
   final boundedHeight = (data.gridHeight / 8).round().clamp(0, 63);
   final boundedAux = aux.clamp(0, 63);
@@ -109,19 +118,34 @@ BarcodeData? _decodeBits(List<int> bits, int offset) {
   final body = bits.sublist(bodyStart, bodyStart + 21);
   final zones = body[8] == 1;
   final aux = _bitsToInt(body, 15, 6);
+  final version = _bitsToInt(body, 0, 2);
+  final laneCode = version >= 3 ? aux >> 4 : ((aux & 0x20) != 0 ? 1 : 0);
+  final lanes = zones
+      ? 1
+      : laneCode == 3
+      ? 6
+      : laneCode == 2
+      ? 4
+      : laneCode == 1
+      ? 2
+      : 1;
   final encodingIndex = _bitsToInt(body, 2, 3);
   if (encodingIndex >= GridEncoding.values.length) return null;
   final rateIndex = _bitsToInt(body, 5, 3);
   if (rateIndex >= _rates.length) return null;
   return BarcodeData(
-    version: _bitsToInt(body, 0, 2),
+    version: version,
     encoding: GridEncoding.values[encodingIndex],
     rate: _rates[rateIndex],
     zones: zones,
     ringWidth: zones ? aux : 0,
-    gridWidth: zones ? 0 : ((aux & 0x1f) == 0 ? 32 : (aux & 0x1f)) * 8,
+    gridWidth: zones
+        ? 0
+        : version >= 3
+        ? (aux & 0x0f) * 8
+        : ((aux & 0x1f) == 0 ? 32 : (aux & 0x1f)) * 8,
     gridHeight: _bitsToInt(body, 9, 6) * 8,
-    lanes: zones ? 1 : ((aux & 0x20) != 0 ? 2 : 1),
+    lanes: lanes,
   );
 }
 
@@ -136,18 +160,29 @@ class TimingBarcodeData {
   final int lane;
 }
 
-List<int> _timingPattern(TimingBarcodeData data) {
-  final body = <int>[
-    ..._intToBits(1, 2),
-    ..._intToBits((data.fps * 2).round().clamp(0, 255), 8),
-    ..._intToBits(data.tick & 0x3ff, 10),
-    data.lane & 1,
-  ];
+List<int> _timingPattern(TimingBarcodeData data, int metadataVersion) {
+  final body = metadataVersion >= 3
+      ? <int>[
+          ..._intToBits(2, 2),
+          ..._intToBits((data.fps * 2).round().clamp(0, 255), 8),
+          ..._intToBits(data.tick & 0xff, 8),
+          ..._intToBits(data.lane & 7, 3),
+        ]
+      : <int>[
+          ..._intToBits(1, 2),
+          ..._intToBits((data.fps * 2).round().clamp(0, 255), 8),
+          ..._intToBits(data.tick & 0x3ff, 10),
+          data.lane & 1,
+        ];
   return <int>[..._sync, ...body, ..._intToBits(_crc7(body), 7)];
 }
 
-Uint8List encodeTimingBarcodeRow(TimingBarcodeData data, int gridWidth) {
-  final pattern = _timingPattern(data);
+Uint8List encodeTimingBarcodeRow(
+  TimingBarcodeData data,
+  int gridWidth, {
+  int metadataVersion = barcodeVersion,
+}) {
+  final pattern = _timingPattern(data, metadataVersion);
   final output = Uint8List(gridWidth * 3);
   for (var cell = 0; cell < gridWidth; cell++) {
     final value = pattern[(cell ~/ barcodeBarCells) % barcodePatternLength] == 1
@@ -162,11 +197,12 @@ TimingBarcodeData? decodeTimingBarcodeLuminance(List<double> luminance) {
   final decoded = _decodePatternBits(luminance);
   if (decoded == null) return null;
   final body = decoded.sublist(_sync.length, _sync.length + 21);
-  if (_bitsToInt(body, 0, 2) != 1) return null;
+  final version = _bitsToInt(body, 0, 2);
+  if (version != 1 && version != 2) return null;
   return TimingBarcodeData(
     fps: _bitsToInt(body, 2, 8) / 2,
-    tick: _bitsToInt(body, 10, 10),
-    lane: _bitsToInt(body, 20, 1),
+    tick: version >= 2 ? _bitsToInt(body, 10, 8) : _bitsToInt(body, 10, 10),
+    lane: version >= 2 ? _bitsToInt(body, 18, 3) : _bitsToInt(body, 20, 1),
   );
 }
 
@@ -198,8 +234,9 @@ List<int>? _decodePatternBits(List<double> luminance) {
       if (!List.generate(
         _sync.length,
         (i) => bits[offset + i] == _sync[i],
-      ).every((v) => v))
+      ).every((v) => v)) {
         continue;
+      }
       final body = bits.sublist(
         offset + _sync.length,
         offset + _sync.length + 21,

@@ -623,7 +623,15 @@ List<MatrixRect> locateOuterFrames(LumaPlane image, {int maxCount = 2}) {
       .take(maxCount)
       .map((value) => _refineWithFinders(image, value.$2))
       .toList();
-  selected.sort((a, b) => a.left.compareTo(b.left));
+  // Sender layouts are always two columns and up to three rows. Preserve that
+  // visual lane order (L0/L1 on the first row, then the rows below) so timing
+  // fallback and worker affinity remain deterministic before row 2 locks.
+  selected.sort((a, b) {
+    final ay = a.top + a.height / 2;
+    final by = b.top + b.height / 2;
+    final sameRow = (ay - by).abs() < math.min(a.height, b.height) * 0.45;
+    return sameRow ? a.left.compareTo(b.left) : ay.compareTo(by);
+  });
   return selected;
 }
 
@@ -698,7 +706,7 @@ BarcodeData? locateBarcode(LumaPlane image, MatrixRect outer) {
       sampleBarcodeLuma(image, outer, width, approximateHeight),
     );
     if (decoded != null &&
-        decoded.version == barcodeVersion &&
+        (decoded.version == barcodeVersion || decoded.version == 3) &&
         (decoded.gridWidth == 0 || decoded.gridWidth == width)) {
       return decoded;
     }

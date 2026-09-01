@@ -129,8 +129,10 @@ DecodedFrame? _parseMessage(Uint8List message) {
   if (message.length < frameHeaderBytes + frameCrcBytes) return null;
   final crcOffset = message.length - frameCrcBytes;
   final view = ByteData.sublistView(message);
-  if (view.getUint32(crcOffset, Endian.little) != crc32(message, 0, crcOffset))
+  if (view.getUint32(crcOffset, Endian.little) !=
+      crc32(message, 0, crcOffset)) {
     return null;
+  }
   final length = view.getUint32(5, Endian.little);
   if (length > crcOffset - frameHeaderBytes) return null;
   return DecodedFrame(
@@ -152,7 +154,6 @@ DecodedFrame? decodeFrameLlr(
 }) {
   if (capacity < 1 || transmittedLlr.length < capacity * 8) return null;
   final plan = _decodePlan(capacity, rate);
-  final messageBytes = plan.messageBytes;
   final code = plan.code;
   final permutation = plan.permutation;
   final codewordLlr = Float64List(code.n);

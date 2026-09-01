@@ -76,4 +76,31 @@ void main() {
     expect(decoded?.tick, 777);
     expect(decoded?.lane, 1);
   });
+
+  test('v3 advertises four and six lanes with lane-five timing', () {
+    for (final lanes in <int>[4, 6]) {
+      final source = BarcodeData(
+        version: 3,
+        encoding: GridEncoding.color8,
+        rate: 0.625,
+        zones: false,
+        gridWidth: 72,
+        gridHeight: 72,
+        lanes: lanes,
+      );
+      final row = encodeBarcodeRow(source, 72);
+      final decoded = decodeBarcodeLuminance(<double>[
+        for (var cell = 0; cell < 72; cell++) row[cell * 3].toDouble(),
+      ]);
+      expect(decoded?.version, 3);
+      expect(decoded?.lanes, lanes);
+    }
+    const timing = TimingBarcodeData(fps: 12, tick: 233, lane: 5);
+    final row = encodeTimingBarcodeRow(timing, 72, metadataVersion: 3);
+    final decoded = decodeTimingBarcodeLuminance(<double>[
+      for (var cell = 0; cell < 72; cell++) row[cell * 3].toDouble(),
+    ]);
+    expect(decoded?.tick, 233);
+    expect(decoded?.lane, 5);
+  });
 }

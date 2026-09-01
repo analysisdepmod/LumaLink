@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'protocol/color8.dart';
+import 'protocol/control_barcode.dart';
 import 'protocol/frame_codec.dart';
 import 'protocol/frame_locator.dart';
 import 'protocol/meta_barcode.dart';
@@ -25,8 +26,9 @@ BarcodeData? barcodeFromMessage(Object? value) {
   final encoding = value['encoding'];
   if (encoding is! int ||
       encoding < 0 ||
-      encoding >= GridEncoding.values.length)
+      encoding >= GridEncoding.values.length) {
     return null;
+  }
   return BarcodeData(
     version: value['version'] as int? ?? barcodeVersion,
     encoding: GridEncoding.values[encoding],
@@ -51,8 +53,8 @@ void nativeDecodeWorkerEntry(Object bootstrap) {
       ? 0
       : (bootstrap as Map<Object?, Object?>)['workerId'] as int;
   final inbox = ReceivePort();
-  final trackedFrames = <MatrixRect?>[null, null];
-  final trackedAges = <int>[0, 0];
+  final trackedFrames = List<MatrixRect?>.filled(6, null);
+  final trackedAges = List<int>.filled(6, 0);
   final spatialEqualizer = Color8SpatialEqualizer();
   var spatialBlur = 0.0;
   var spatialSamples = 0;
@@ -80,10 +82,12 @@ void nativeDecodeWorkerEntry(Object bootstrap) {
           .materialize()
           .asUint8List();
       final knownValues = message['barcodes'] as List? ?? const <Object?>[];
-      final known = <BarcodeData?>[
-        barcodeFromMessage(knownValues.isNotEmpty ? knownValues[0] : null),
-        barcodeFromMessage(knownValues.length > 1 ? knownValues[1] : null),
-      ];
+      final known = List<BarcodeData?>.generate(
+        6,
+        (index) => barcodeFromMessage(
+          knownValues.length > index ? knownValues[index] : null,
+        ),
+      );
       final lastTicks = (message['lastTicks'] as List).cast<int>();
       final frame = Yuv420Frame(
         width: message['width'] as int,
@@ -98,7 +102,14 @@ void nativeDecodeWorkerEntry(Object bootstrap) {
         vPixelStride: message['vPixelStride'] as int,
       );
       final replies = <Map<String, Object?>>[];
-      final outers = locateOuterFrames(frame.luma, maxCount: 2);
+      final advertisedLanes = known.whereType<BarcodeData>().fold<int>(
+        1,
+        (count, barcode) => math.max(count, barcode.lanes),
+      );
+      final outers = locateOuterFrames(
+        frame.luma,
+        maxCount: advertisedLanes.clamp(2, 6),
+      );
       var locked = false;
       var freshBarcodes = 0;
       var fallbackBarcodes = 0;
@@ -172,14 +183,33 @@ void nativeDecodeWorkerEntry(Object bootstrap) {
         locked = true;
         final timing = locateTimingBarcode(frame.luma, outer, barcode);
         if (timing != null) timingRows++;
-        final lane = timing?.lane ?? visualIndex.clamp(0, 1);
-        if (timing != null && lastTicks[lane] == timing.tick) {
+        final lane = timing?.lane ?? visualIndex.clamp(0, 5);
+        final controlPage = barcode.version >= 3
+            ? decodeControlBarcodeLuminance(
+                sampleBarcodeLumaAtRow(
+                  frame.luma,
+                  outer,
+                  barcode.gridWidth,
+                  barcode.gridHeight,
+                  controlBarcodeRow,
+                ),
+              )
+            : null;
+        if (timing != null &&
+            lane < lastTicks.length &&
+            lastTicks[lane] == timing.tick) {
           duplicateFrames++;
           replies.add(<String, Object?>{
             'lane': lane,
             'tick': timing.tick,
             'fps': timing.fps,
             'barcode': barcodeToMessage(barcode),
+            if (controlPage != null)
+              'controlPage': <String, int>{
+                'page': controlPage.page,
+                'tag': controlPage.tag,
+                'payload': controlPage.payload,
+              },
             'duplicate': true,
           });
           continue;
@@ -217,32 +247,71 @@ void nativeDecodeWorkerEntry(Object bootstrap) {
           GridEncoding.color8 => softDemodulateColor8(sampled),
           _ => softDemodulateMultiColor(sampled, barcode.encoding),
         };
-        final decoded = decodeFrameLlr(
-          llr,
-          capacity,
-          barcode.rate,
-          iterations:
-              barcode.encoding == GridEncoding.color8 && barcode.gridWidth <= 72
-              ? 12
-              : 16,
-        );
-        if (decoded != null) {
-          decodedFrames++;
-          if (decoded.type == frameManifest) decodedManifest++;
-          if (decoded.type == frameData) decodedData++;
+        final decoded = <DecodedFrame>[];
+        if (barcode.version >= 3 && barcode.encoding == GridEncoding.color8) {
+          final capacities = segmentedColor8Capacities(
+            barcode.gridWidth,
+            barcode.gridHeight,
+          );
+          final segments = splitSegmentedColor8Llr(
+            llr,
+            barcode.gridWidth,
+            barcode.gridHeight,
+          );
+          for (var segment = 0; segment < segments.length; segment++) {
+            final value = decodeFrameLlr(
+              segments[segment],
+              capacities[segment],
+              barcode.rate,
+              iterations: 12,
+            );
+            if (value != null) decoded.add(value);
+          }
+        } else {
+          final value = decodeFrameLlr(
+            llr,
+            capacity,
+            barcode.rate,
+            iterations:
+                barcode.encoding == GridEncoding.color8 &&
+                    barcode.gridWidth <= 72
+                ? 12
+                : 16,
+          );
+          if (value != null) decoded.add(value);
         }
-        replies.add(<String, Object?>{
+        decodedFrames += decoded.length;
+        decodedManifest += decoded
+            .where((value) => value.type == frameManifest)
+            .length;
+        decodedData += decoded.where((value) => value.type == frameData).length;
+        final common = <String, Object?>{
           'lane': lane,
           if (timing != null) 'tick': timing.tick,
           if (timing != null) 'fps': timing.fps,
           'barcode': barcodeToMessage(barcode),
-          if (decoded != null) 'type': decoded.type,
-          if (decoded != null) 'seed': decoded.seed,
-          if (decoded != null)
-            'payload': TransferableTypedData.fromList(<Uint8List>[
-              decoded.payload,
-            ]),
-        });
+          'opticalComplete': barcode.version < 3 || decoded.length == 4,
+          if (controlPage != null)
+            'controlPage': <String, int>{
+              'page': controlPage.page,
+              'tag': controlPage.tag,
+              'payload': controlPage.payload,
+            },
+        };
+        if (decoded.isEmpty) {
+          replies.add(common);
+        } else {
+          for (final value in decoded) {
+            replies.add(<String, Object?>{
+              ...common,
+              'type': value.type,
+              'seed': value.seed,
+              'payload': TransferableTypedData.fromList(<Uint8List>[
+                value.payload,
+              ]),
+            });
+          }
+        }
       }
       watch.stop();
       parent.send(<String, Object?>{

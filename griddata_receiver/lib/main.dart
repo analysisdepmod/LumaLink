@@ -4,7 +4,6 @@ import 'dart:developer' as developer;
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
-import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -13,6 +12,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'native_decode_worker.dart';
 import 'protocol/frame_codec.dart';
+import 'protocol/control_barcode.dart';
 import 'protocol/fountain_decoder.dart';
 import 'protocol/meta_barcode.dart';
 import 'protocol/transfer_manifest.dart';
@@ -67,10 +67,12 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   int _decoderWorkerCount = 0;
   int _deviceMemoryMb = 0;
   static const int _maxPendingDataFrames = 192;
-  final List<BarcodeData?> _barcodes = <BarcodeData?>[null, null];
-  final List<int> _lastTicks = <int>[-1, -1];
+  final List<BarcodeData?> _barcodes = List<BarcodeData?>.filled(6, null);
+  final List<int> _lastTicks = List<int>.filled(6, -1);
   final List<DecodedFrame> _pendingData = <DecodedFrame>[];
   ManifestAssembler _manifestAssembler = ManifestAssembler();
+  TransferControlAssembler _controlAssembler = TransferControlAssembler();
+  TransferControl? _control;
   TransferManifest? _manifest;
   FountainDecoder? _fountain;
   bool _savingTransfer = false;
@@ -91,6 +93,11 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   File? _completedFile;
   bool _retainingFile = false;
 
+  int get _activeLaneCount => _barcodes
+      .whereType<BarcodeData>()
+      .fold<int>(1, (count, barcode) => math.max(count, barcode.lanes))
+      .clamp(1, 6);
+
   @override
   void initState() {
     super.initState();
@@ -110,9 +117,9 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       _deviceMemoryMb = 0;
     }
     _decoderWorkerCount = switch ((cores, _deviceMemoryMb)) {
-      (>= 10, >= 10000) => 4,
-      (>= 8, >= 5500) => 3,
-      (>= 6, >= 3000) => 2,
+      (>= 10, >= 8000) => 6,
+      (>= 8, >= 5500) => 4,
+      (>= 6, >= 3000) => 3,
       _ => 1,
     };
     _decodeRequests.addAll(List<SendPort?>.filled(_decoderWorkerCount, null));
@@ -180,7 +187,7 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       if (!mounted) return;
       setState(() {
         _camera = controller;
-        _state = 'وجّه الكاميرا نحو مصفوفتَي LumaLink';
+        _state = 'وجّه الكاميرا نحو مصفوفات LumaLink';
       });
     } on CameraException catch (error) {
       await controller.dispose();
@@ -229,8 +236,8 @@ class _ReceiverScreenState extends State<ReceiverScreen>
           .map((value) => value == null ? null : barcodeToMessage(value))
           .toList(),
       'lastTicks': List<int>.from(_lastTicks),
-      if (_barcodes.any((value) => value?.lanes == 2))
-        'preferredLane': workerId % 2,
+      if (_barcodes.any((value) => (value?.lanes ?? 1) > 1))
+        'preferredLane': _decodeRequestId % _activeLaneCount,
     });
   }
 
@@ -260,21 +267,35 @@ class _ReceiverScreenState extends State<ReceiverScreen>
     for (final value in results) {
       if (value is! Map || value['lane'] is! int) continue;
       final lane = value['lane'] as int;
-      if (lane < 0 || lane > 1) continue;
+      if (lane < 0 || lane > 5) continue;
       final barcode = barcodeFromMessage(value['barcode']);
       if (barcode == null) continue;
       _barcodes[lane] = barcode;
+      final controlValue = value['controlPage'];
+      if (controlValue is Map) {
+        final page = controlValue['page'];
+        final tag = controlValue['tag'];
+        final payload = controlValue['payload'];
+        if (page is int && tag is int && payload is int) {
+          final control = _controlAssembler.add(
+            TransferControlPage(page: page, tag: tag, payload: payload),
+          );
+          if (control != null) _acceptControl(control);
+        }
+      }
       final fps = value['fps'];
       if (fps is num) _senderFps = fps.toDouble().clamp(2, 30);
       if (value['duplicate'] == true) continue;
       final type = value['type'];
       final seed = value['seed'];
       final payload = value['payload'];
-      if (type is! int || seed is! int || payload is! TransferableTypedData)
+      if (type is! int || seed is! int || payload is! TransferableTypedData) {
         continue;
+      }
       final tick = value['tick'];
-      if (tick is int && _lastTicks[lane] == tick) continue;
-      if (tick is int) _lastTicks[lane] = tick;
+      if (tick is int && value['opticalComplete'] == true) {
+        _lastTicks[lane] = tick;
+      }
       _validFrames++;
       _decoderError = null;
       _acceptFrame(
@@ -308,7 +329,7 @@ class _ReceiverScreenState extends State<ReceiverScreen>
         'decoderError': _decoderError,
         'fountain': _fountain == null
             ? null
-            : '${_fountain!.uniqueChunks}/${_manifest!.k} chunks, ${_fountain!.receivedEquations} equations',
+            : '${_fountain!.uniqueChunks}/${_manifest?.k ?? _control?.k ?? 0} chunks, ${_fountain!.receivedEquations} equations',
         'senderFps': _senderFps,
         'knownBarcodes': _barcodes
             .map(
@@ -325,12 +346,54 @@ class _ReceiverScreenState extends State<ReceiverScreen>
     }
     if (mounted && _manifest == null) {
       setState(
-        () => _state = message['locked'] == true
+        () => _state = _control != null
+            ? 'تم قفل معلومات النقل — جاري استلام الملف'
+            : message['locked'] == true
             ? 'تم القفل على المصفوفة — جاري استلام معلومات الملف'
             : 'جاري البحث عن المصفوفة',
       );
     } else if (mounted) {
       setState(() {});
+    }
+  }
+
+  void _acceptControl(TransferControl control) {
+    if (control.k < 1 ||
+        control.k > 1000000 ||
+        control.chunk < 1 ||
+        control.chunk > 65535 ||
+        control.compressedBytes < 0 ||
+        control.compressedBytes > 1073741824) {
+      return;
+    }
+    if (_manifest?.id == control.id &&
+        _manifest?.k == control.k &&
+        _manifest?.chunkSize == control.chunk &&
+        _fountain != null) {
+      _control = control;
+      return;
+    }
+    if (_control?.id == control.id && _fountain != null) return;
+    if (_manifest != null && _manifest!.id != control.id) {
+      _manifest = null;
+      _manifestAssembler = ManifestAssembler();
+      _completedFile = null;
+      _savingTransfer = false;
+    }
+    _control = control;
+    _fountain = FountainDecoder(control.k, control.chunk, mediumWideEvery: 2);
+    final earlyFrames = List<DecodedFrame>.from(_pendingData);
+    _pendingData.clear();
+    for (final early in earlyFrames) {
+      if (_fountain!.addFrame(early.seed, early.payload)) {
+        _receivedPayloadBytes += early.payload.length;
+      }
+    }
+    _lastSpeedSample = DateTime.now();
+    _lastSpeedBytes = _receivedPayloadBytes;
+    _transferBytesPerSecond = 0;
+    if (mounted) {
+      setState(() => _state = 'تم قفل معلومات النقل — جاري استلام الملف');
     }
   }
 
@@ -363,15 +426,29 @@ class _ReceiverScreenState extends State<ReceiverScreen>
           }),
         ),
       );
-      _fountain = FountainDecoder(
-        manifest.k,
-        manifest.chunkSize,
-        mediumWideEvery: manifest.version == 8
-            ? 1
-            : (manifest.version >= 9 ? 2 : 4),
+      final reuseControlDecoder =
+          _control?.id == manifest.id &&
+          _control?.k == manifest.k &&
+          _control?.chunk == manifest.chunkSize &&
+          _fountain != null;
+      if (!reuseControlDecoder) {
+        _fountain = FountainDecoder(
+          manifest.k,
+          manifest.chunkSize,
+          mediumWideEvery: manifest.version == 8
+              ? 1
+              : (manifest.version >= 9 ? 2 : 4),
+        );
+      }
+      _control = TransferControl(
+        id: manifest.id,
+        k: manifest.k,
+        chunk: manifest.chunkSize,
+        compressedBytes: manifest.compressedBytes,
       );
-      if (manifest.senderFps != null)
+      if (manifest.senderFps != null) {
         _senderFps = manifest.senderFps!.clamp(2, 30);
+      }
       // Turbo can deliver valid data while the receiver is still assembling
       // the repeated manifest. Keep those frames and replay them immediately;
       // dropping them made the phone look completely idle with short files and
@@ -379,7 +456,9 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       final earlyFrames = List<DecodedFrame>.from(_pendingData);
       _pendingData.clear();
       for (final early in earlyFrames) {
-        _fountain!.addFrame(early.seed, early.payload);
+        if (_fountain!.addFrame(early.seed, early.payload)) {
+          _receivedPayloadBytes += early.payload.length;
+        }
       }
       _lastSpeedSample = DateTime.now();
       _lastSpeedBytes = _receivedPayloadBytes;
@@ -398,27 +477,28 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       return;
     }
     if (frame.type != frameData) return;
-    _receivedPayloadBytes += frame.payload.length;
-    _updateTransferSpeed();
     final manifest = _manifest;
     final fountain = _fountain;
-    if (manifest == null || fountain == null) {
+    if (fountain == null) {
       if (_pendingData.length < _maxPendingDataFrames) {
         _pendingData.add(frame);
       }
       return;
     }
     if (_savingTransfer) return;
-    fountain.addFrame(frame.seed, frame.payload);
+    if (fountain.addFrame(frame.seed, frame.payload)) {
+      _receivedPayloadBytes += frame.payload.length;
+      _updateTransferSpeed();
+    }
     if (mounted) setState(() => _state = 'جاري استلام الملف');
-    if (fountain.isComplete) {
+    if (fountain.isComplete && manifest != null) {
       _savingTransfer = true;
       unawaited(_finish(fountain, manifest));
     }
   }
 
   void _updateTransferSpeed() {
-    if (_fountain == null || _manifest == null) return;
+    if (_fountain == null || (_manifest == null && _control == null)) return;
     final now = DateTime.now();
     final bytes = _receivedPayloadBytes;
     final previous = _lastSpeedSample;
@@ -508,15 +588,17 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   Future<void> _restartReception() async {
     setState(() {
       _manifestAssembler = ManifestAssembler();
+      _controlAssembler = TransferControlAssembler();
+      _control = null;
       _manifest = null;
       _fountain = null;
       _pendingData.clear();
       _barcodes
         ..clear()
-        ..addAll(<BarcodeData?>[null, null]);
+        ..addAll(List<BarcodeData?>.filled(6, null));
       _lastTicks
         ..clear()
-        ..addAll(<int>[-1, -1]);
+        ..addAll(List<int>.filled(6, -1));
       _validFrames = 0;
       _savingTransfer = false;
       _decoderError = null;
@@ -526,7 +608,7 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       _transferBytesPerSecond = 0;
       _completedFile = null;
       _retainingFile = false;
-      _state = 'وجّه الكاميرا نحو مصفوفتَي LumaLink';
+      _state = 'وجّه الكاميرا نحو مصفوفات LumaLink';
     });
     final camera = _camera;
     if (camera != null &&
@@ -567,20 +649,19 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   Widget build(BuildContext context) {
     final camera = _camera;
     final fountain = _fountain;
-    final progress = fountain == null || _manifest == null
+    final targetK = _manifest?.k ?? _control?.k;
+    final targetBytes = _manifest?.compressedBytes ?? _control?.compressedBytes;
+    final chunkSize = _manifest?.chunkSize ?? _control?.chunk;
+    final progress = fountain == null || targetK == null
         ? 0.0
-        : fountain.uniqueChunks / _manifest!.k;
-    final receivedBytes = fountain == null || _manifest == null
+        : fountain.uniqueChunks / targetK;
+    final receivedBytes =
+        fountain == null || targetBytes == null || chunkSize == null
         ? 0
-        : math.min(
-            _manifest!.compressedBytes,
-            fountain.uniqueChunks * _manifest!.chunkSize,
-          );
-    final remainingSeconds = _transferBytesPerSecond <= 0 || _manifest == null
+        : math.min(targetBytes, fountain.uniqueChunks * chunkSize);
+    final remainingSeconds = _transferBytesPerSecond <= 0 || targetBytes == null
         ? null
-        : ((_manifest!.compressedBytes - receivedBytes) /
-                  _transferBytesPerSecond)
-              .ceil();
+        : ((targetBytes - receivedBytes) / _transferBytesPerSecond).ceil();
     return Directionality(
       textDirection: TextDirection.rtl,
       child: Scaffold(
@@ -607,7 +688,7 @@ class _ReceiverScreenState extends State<ReceiverScreen>
                     fileName: _manifest?.name,
                     totalBytes: _manifest?.total,
                     progress: progress,
-                    transferStarted: _manifest != null,
+                    transferStarted: _manifest != null || _control != null,
                     bytesPerSecond: _transferBytesPerSecond,
                     remainingSeconds: remainingSeconds,
                     completed: _completedFile != null,

@@ -15,6 +15,8 @@ class LdpcCode {
   final int m;
   final List<List<int>> messageChecks;
   final List<List<int>> checkMessages;
+  // Internal cached plan exposed only because LdpcCode itself is public.
+  // ignore: library_private_types_in_public_api
   _LdpcDecodePlan? decodePlan;
   int get n => k + m;
 }
@@ -138,8 +140,9 @@ _LdpcDecodePlan _makeDecodePlan(LdpcCode code) {
 /// decoder. It avoids exp/log/tanh in the old sum-product path and reuses the
 /// immutable Tanner graph plus working buffers between camera frames.
 Uint8List decode(LdpcCode code, Float64List llr, {int iterations = 24}) {
-  if (llr.length < code.n)
+  if (llr.length < code.n) {
     throw ArgumentError('LLR vector is shorter than codeword');
+  }
   final plan = code.decodePlan ??= _makeDecodePlan(code);
   final checkVars = plan.checkVars;
   final messagesVc = plan.messagesVc;

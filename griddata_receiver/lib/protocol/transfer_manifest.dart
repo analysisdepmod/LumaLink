@@ -54,7 +54,7 @@ class TransferManifest {
       return number >= min && number <= max ? number : null;
     }
 
-    final version = integer('v', 1, 10);
+    final version = integer('v', 1, 11);
     final id = integer('id', 0, 0xffffffff);
     final total = integer('total', 0, 1073741824);
     final compressedBytes = integer('comp', 0, 1073741824);
@@ -168,11 +168,12 @@ TransferManifest? _decodeCompactManifest(Uint8List body, BarcodeData? optical) {
       optical == null ||
       body[0] != 0x47 ||
       body[1] != 0x44 ||
-      body[2] != 0x02)
+      body[2] != 0x02) {
     return null;
+  }
   var offset = 3;
   final version = body[offset++];
-  if (version < 6 || version > 10) return null;
+  if (version < 6 || version > 11) return null;
   final id = _u32(body, offset);
   offset += 4;
   final flags = body[offset++];
@@ -197,8 +198,9 @@ TransferManifest? _decodeCompactManifest(Uint8List body, BarcodeData? optical) {
       k < 1 ||
       k > 1000000 ||
       chunk < 1 ||
-      offset + nameLength + mimeLength != body.length)
+      offset + nameLength + mimeLength != body.length) {
     return null;
+  }
   final name = utf8.decode(body.sublist(offset, offset + nameLength));
   offset += nameLength;
   final mime = utf8.decode(body.sublist(offset, offset + mimeLength));
@@ -226,16 +228,18 @@ Future<Uint8List> finishTransfer(
   Uint8List chunks,
   TransferManifest manifest,
 ) async {
-  if (chunks.length < manifest.compressedBytes)
+  if (chunks.length < manifest.compressedBytes) {
     throw StateError('Reconstruction is shorter than manifest');
+  }
   final packed = Uint8List.fromList(
     chunks.sublist(0, manifest.compressedBytes),
   );
   final bytes = manifest.compressed
       ? Uint8List.fromList(ZLibDecoder().decodeBytes(packed))
       : packed;
-  if (bytes.length != manifest.total)
+  if (bytes.length != manifest.total) {
     throw StateError('Completed file length does not match manifest');
+  }
   if (manifest.sha256 != null &&
       sha256.convert(bytes).toString() != manifest.sha256) {
     throw StateError('SHA-256 verification failed');
