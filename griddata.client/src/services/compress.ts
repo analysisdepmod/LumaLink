@@ -18,6 +18,25 @@ export function unpackPayload(data: Uint8Array, compressed = true): Uint8Array {
   return inflate(data)
 }
 
+/**
+ * Inflate larger completed transfers through the browser's streaming codec
+ * when available. This yields back to the UI and avoids making a completed
+ * receiver look as if it is still decoding camera frames.
+ */
+export async function unpackPayloadAsync(data: Uint8Array, compressed = true): Promise<Uint8Array> {
+  if (!compressed) return data.slice()
+  if (typeof DecompressionStream !== 'undefined') {
+    try {
+      const source = new Blob([Uint8Array.from(data)]).stream()
+      const output = source.pipeThrough(new DecompressionStream('deflate'))
+      return new Uint8Array(await new Response(output).arrayBuffer())
+    } catch {
+      // Older WebViews may expose DecompressionStream without deflate support.
+    }
+  }
+  return inflate(data)
+}
+
 /** Used by the compact manifest envelope, which is always compressed. */
 export function compress(data: Uint8Array): Uint8Array { return deflate(data) }
 export function decompress(data: Uint8Array): Uint8Array { return inflate(data) }

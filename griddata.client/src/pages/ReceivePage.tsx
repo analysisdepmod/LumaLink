@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Card, Button, Progress, Typography, Space,
-  Alert, Result, Input, Tag, message, Segmented, Switch,
+  Result, Input, Tag, message, Segmented, Switch,
 } from 'antd'
 import {
   CameraOutlined, CheckCircleOutlined, DownloadOutlined, CopyOutlined, ReloadOutlined,
@@ -150,6 +150,7 @@ export default function ReceivePage() {
   const [, setManifestEpoch] = useState(0)
   const [snap, setSnap] = useState<Snapshot>(EMPTY)
   const [result, setResult] = useState<Result_ | null>(null)
+  const [finalizing, setFinalizing] = useState(false)
   const [camRes, setCamRes] = useState<{ w: number; h: number; fps?: number } | null>(null)
   // The worker auto-detects the sender's encoding/grid/rate — no manual matching.
   const [detected, setDetected] = useState<EncodingSpec | null>(null)
@@ -196,7 +197,11 @@ export default function ReceivePage() {
     timelineRef.current = []
     timelineStartedAtRef.current = 0
     setSnap(EMPTY)
-    setResult(null)
+    setResult(current => {
+      if (current?.url) URL.revokeObjectURL(current.url)
+      return null
+    })
+    setFinalizing(false)
     setDetected(null)
     lockTonePlayedRef.current = false
     cameraRef.current = null
@@ -403,6 +408,7 @@ export default function ReceivePage() {
     // required, and transferred bytes are never sent over any network path.
     void saveDiagnosticReport(benchmark.report)
     setActive(false)
+    setFinalizing(false)
     if (kind === 'text') {
       setResult({ name, mime, kind, bytes, text: new TextDecoder().decode(bytes), benchmark })
     } else {
@@ -414,13 +420,20 @@ export default function ReceivePage() {
   const finish = useCallback(async () => {
     const m = manifestRef.current
     const dec = decoderRef.current
-    if (!m || !dec) return
+    if (!m || !dec || doneRef.current) return
     doneRef.current = true
+    setActive(false)
+    setFinalizing(true)
     try {
+      // Let React replace the live camera with the finalization screen before
+      // inflate/hash work begins. At 100% the optical transfer is already over.
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
       const bytes = await finishTransfer(dec.reconstruct(), m)
       present(m.kind, m.name, m.mime, bytes, !!m.sha256, m)
     } catch (error) {
       doneRef.current = false
+      setFinalizing(false)
+      setActive(true)
       message.error(error instanceof Error ? error.message : 'File verification failed')
     }
   }, [present])
@@ -571,74 +584,61 @@ export default function ReceivePage() {
   }, [active, recordTimelineSample])
 
   const pct = snap.k > 0 ? Math.round((snap.rank / snap.k) * 100) : 0
+  if (finalizing) {
+    return (
+      <div style={{ maxWidth: 560, margin: '40px auto' }}>
+        <Result
+          status="info"
+          icon={<ReloadOutlined spin />}
+          title="تم استلام كل الحزم"
+          subTitle="جاري فك ضغط الملف والتحقق من سلامته… لا حاجة لتوجيه الكاميرا الآن."
+        />
+      </div>
+    )
+  }
   if (result) {
     return (
-      <div style={{ maxWidth: 640, margin: '0 auto' }}>
-        <Result
-          status="success"
-          icon={<CheckCircleOutlined />}
-          title="اكتمل الاستقبال بنجاح"
-          subTitle={`${result.name} — ${(result.bytes.length / 1024).toFixed(1)} كيلوبايت`}
-        />
-        {result.benchmark && (
-          <Alert
-            type="info"
-            showIcon
-            style={{ marginBottom: 16 }}
-            message={`Optical: ${result.benchmark.goodputKBs.toFixed(1)} KB/s · File effective: ${result.benchmark.applicationGoodputKBs.toFixed(1)} KB/s · ${result.benchmark.seconds.toFixed(2)} s`}
-            description={`Valid frames: ${result.benchmark.validFrames}/${result.benchmark.attempts}${result.benchmark.verified ? ' · SHA-256 verified' : ''}`}
+      <div className="opt-page" style={{ maxWidth: 560 }}>
+        <Card className="opt-card opt-panel" bordered={false} style={{ textAlign: 'center' }}>
+          <Result
+            status="success"
+            icon={<CheckCircleOutlined />}
+            title="اكتمل الاستقبال"
+            subTitle={`${result.name} — ${(result.bytes.length / 1024).toFixed(1)} كيلوبايت`}
           />
-        )}
-        {result.benchmark && (
-          <Card size="small" title="Benchmark report" style={{ marginBottom: 16 }}>
-            <Space wrap style={{ marginBottom: 10 }}>
-              <Tag color="blue">File: {(result.bytes.length / 1024).toFixed(2)} KiB</Tag>
-              <Tag color="green">Optical: {result.benchmark.goodputKBs.toFixed(1)} KB/s</Tag>
-              <Tag color="cyan">File effective: {result.benchmark.applicationGoodputKBs.toFixed(1)} KB/s</Tag>
-              <Tag color={result.benchmark.verified ? 'success' : 'warning'}>{result.benchmark.verified ? 'SHA-256 verified' : 'No SHA-256'}</Tag>
-            </Space>
-            {result.benchmark.calibration && (
-              <Alert
-                type={result.benchmark.calibration.status === 'clean' ? 'success' : result.benchmark.calibration.status === 'stable' ? 'info' : 'warning'}
-                showIcon
-                message={`${result.benchmark.calibration.label} · كفاءة ${Math.round(result.benchmark.calibration.utilization * 100)}٪`}
-                description={result.benchmark.calibration.recommendation}
-                style={{ marginBottom: 10 }}
-              />
-            )}
-            <Input.TextArea value={result.benchmark.report} rows={12} readOnly style={{ fontFamily: 'monospace', fontSize: 11 }} />
-            <Button
-              type="primary"
-              icon={<CopyOutlined />}
-              style={{ marginTop: 10 }}
-              onClick={() => navigator.clipboard?.writeText(result.benchmark?.report ?? '').then(() => message.success('Benchmark report copied'))}
-            >
-              Copy benchmark report
-            </Button>
-          </Card>
-        )}
-        {result.kind === 'text' ? (
-          <Card>
+          {result.kind === 'text' ? (
+            <>
             <Input.TextArea value={result.text} rows={8} readOnly />
-            <Space style={{ marginTop: 12 }}>
+            <Space wrap style={{ marginTop: 16, justifyContent: 'center' }}>
               <Button icon={<CopyOutlined />} onClick={() => navigator.clipboard?.writeText(result.text ?? '')}>
                 نسخ النص
               </Button>
-              <Button icon={<ReloadOutlined />} onClick={reset}>استقبال جديد</Button>
             </Space>
-          </Card>
-        ) : (
-          <Card style={{ textAlign: 'center' }}>
-            <Space direction="vertical" size="large">
+            </>
+          ) : (
+            <Space direction="vertical" size="middle">
               <a href={result.url} download={result.name}>
                 <Button type="primary" size="large" icon={<DownloadOutlined />}>
                   تنزيل {result.name}
                 </Button>
               </a>
-              <Button icon={<ReloadOutlined />} onClick={reset}>استقبال جديد</Button>
             </Space>
-          </Card>
-        )}
+          )}
+          <div style={{ marginTop: 16 }}>
+            <Button size="large" icon={<ReloadOutlined />} onClick={reset}>استقبال جديد</Button>
+          </div>
+          {result.benchmark && (
+            <details style={{ marginTop: 20, textAlign: 'right', color: 'rgba(255,255,255,.65)' }}>
+              <summary style={{ cursor: 'pointer' }}>تفاصيل الفحص الفني</summary>
+              <div style={{ marginTop: 10 }}>
+                <Tag color="green">{result.benchmark.goodputKBs.toFixed(1)} KB/s</Tag>
+                <Tag color="blue">{result.benchmark.seconds.toFixed(2)} ثانية</Tag>
+                <Tag color={result.benchmark.verified ? 'success' : 'warning'}>{result.benchmark.verified ? 'تم التحقق من الملف' : 'بلا بصمة تحقق'}</Tag>
+                {result.benchmark.calibration && <p>{result.benchmark.calibration.recommendation}</p>}
+              </div>
+            </details>
+          )}
+        </Card>
       </div>
     )
   }

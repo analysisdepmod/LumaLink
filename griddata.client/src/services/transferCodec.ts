@@ -21,7 +21,7 @@
 // information the joint soft decoder needs. See ldpc.ts / wht.ts.
 
 import { crc32 } from './crc32'
-import { compress, decompress, packPayload, sha256Hex, unpackPayload, type PackedPayload } from './compress'
+import { compress, decompress, packPayload, sha256Hex, unpackPayload, unpackPayloadAsync, type PackedPayload } from './compress'
 import { indicesForSeed } from './fountainDecoder'
 import { capacityBytes, capacityBytesZoned, bytesToBits, bitsToBytes, specRate, DEFAULT_RATE, type Encoding, type EncodingSpec, type ZoneMap } from './visualCodec'
 import { deserializeZoneMap, serializeZoneMap } from './adaptiveZones'
@@ -803,7 +803,7 @@ export function recommendedFrameCount(k: number): number {
  */
 export async function finishTransfer(reconstructed: Uint8Array, manifest: TransferManifest): Promise<Uint8Array> {
   const comp = reconstructed.subarray(0, manifest.comp)
-  const bytes = unpackPayload(comp, manifest.compressed ?? true)
+  const bytes = await unpackPayloadAsync(comp, manifest.compressed ?? true)
   if (manifest.sha256 && await sha256Hex(bytes) !== manifest.sha256)
     throw new Error('SHA-256 verification failed')
   return bytes

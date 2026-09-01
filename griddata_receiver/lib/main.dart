@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'native_decode_worker.dart';
 import 'protocol/frame_codec.dart';
@@ -60,7 +61,7 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   final List<BarcodeData?> _barcodes = <BarcodeData?>[null, null];
   final List<int> _lastTicks = <int>[-1, -1];
   final List<DecodedFrame> _pendingData = <DecodedFrame>[];
-  final ManifestAssembler _manifestAssembler = ManifestAssembler();
+  ManifestAssembler _manifestAssembler = ManifestAssembler();
   TransferManifest? _manifest;
   FountainDecoder? _fountain;
   bool _savingTransfer = false;
@@ -265,7 +266,18 @@ class _ReceiverScreenState extends State<ReceiverScreen>
     TransferManifest manifest,
   ) async {
     try {
-      final bytes = await finishTransfer(fountain.reconstruct(), manifest);
+      final camera = _camera;
+      if (camera != null && camera.value.isStreamingImages) {
+        await camera.stopImageStream();
+      }
+      if (mounted) {
+        setState(() => _state = 'تم استلام كل الحزم\nجاري فك الضغط والتحقق…');
+      }
+      await Future<void>.delayed(Duration.zero);
+      final reconstructed = fountain.reconstruct();
+      final bytes = await Isolate.run(
+        () => finishTransfer(reconstructed, manifest),
+      );
       final file = await saveTransfer(bytes, manifest);
       if (mounted)
         setState(() => _state = 'اكتمل النقل وتحقق SHA-256\n${file.path}');
@@ -282,6 +294,37 @@ class _ReceiverScreenState extends State<ReceiverScreen>
     _torch = !_torch;
     await camera.setFlashMode(_torch ? FlashMode.torch : FlashMode.off);
     if (mounted) setState(() {});
+  }
+
+  Future<void> _restartReception() async {
+    setState(() {
+      _manifestAssembler = ManifestAssembler();
+      _manifest = null;
+      _fountain = null;
+      _pendingData.clear();
+      _barcodes
+        ..clear()
+        ..addAll(<BarcodeData?>[null, null]);
+      _lastTicks
+        ..clear()
+        ..addAll(<int>[-1, -1]);
+      _validFrames = 0;
+      _savingTransfer = false;
+      _decoderError = null;
+      _state = 'وجّه الكاميرا نحو مصفوفتَي LumaLink';
+    });
+    final camera = _camera;
+    if (camera != null &&
+        camera.value.isInitialized &&
+        !camera.value.isStreamingImages) {
+      await camera.startImageStream(_onFrame);
+    }
+  }
+
+  Future<void> _exitApp() async {
+    await _camera?.dispose();
+    _camera = null;
+    await SystemNavigator.pop();
   }
 
   @override
@@ -324,7 +367,12 @@ class _ReceiverScreenState extends State<ReceiverScreen>
             SafeArea(
               child: Column(
                 children: [
-                  _Header(onTorch: _toggleTorch, torch: _torch),
+                  _Header(
+                    onTorch: _toggleTorch,
+                    onReset: _restartReception,
+                    onExit: _exitApp,
+                    torch: _torch,
+                  ),
                   const Spacer(),
                   _StatusCard(
                     state: _state,
@@ -351,8 +399,15 @@ class _ReceiverScreenState extends State<ReceiverScreen>
 }
 
 class _Header extends StatelessWidget {
-  const _Header({required this.onTorch, required this.torch});
+  const _Header({
+    required this.onTorch,
+    required this.onReset,
+    required this.onExit,
+    required this.torch,
+  });
   final VoidCallback onTorch;
+  final VoidCallback onReset;
+  final VoidCallback onExit;
   final bool torch;
 
   @override
@@ -388,7 +443,18 @@ class _Header extends StatelessWidget {
         ),
         IconButton(
           onPressed: onTorch,
+          tooltip: 'المصباح',
           icon: Icon(torch ? Icons.flashlight_on : Icons.flashlight_off),
+        ),
+        IconButton(
+          onPressed: onReset,
+          tooltip: 'إعادة الاستقبال',
+          icon: const Icon(Icons.refresh),
+        ),
+        IconButton(
+          onPressed: onExit,
+          tooltip: 'خروج',
+          icon: const Icon(Icons.close),
         ),
       ],
     ),
