@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
@@ -77,6 +78,10 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   DateTime _lastDiagnosticLog = DateTime.fromMillisecondsSinceEpoch(0);
   File? _diagnosticFile;
   bool _diagnosticWritePending = false;
+  DateTime? _lastSpeedSample;
+  int _lastSpeedBytes = 0;
+  int _receivedPayloadBytes = 0;
+  double _transferBytesPerSecond = 0;
 
   @override
   void initState() {
@@ -240,6 +245,9 @@ class _ReceiverScreenState extends State<ReceiverScreen>
         'validFrames': _validFrames,
         'manifestAccepted': _manifest != null,
         'pendingData': _pendingData.length,
+        'captureFps': _captureFps,
+        'transferBytesPerSecond': _transferBytesPerSecond,
+        'decoderError': _decoderError,
         'fountain': _fountain == null
             ? null
             : '${_fountain!.uniqueChunks}/${_manifest!.k} chunks, ${_fountain!.receivedEquations} equations',
@@ -315,6 +323,9 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       for (final early in earlyFrames) {
         _fountain!.addFrame(early.seed, early.payload);
       }
+      _lastSpeedSample = DateTime.now();
+      _lastSpeedBytes = _receivedPayloadBytes;
+      _transferBytesPerSecond = 0;
       if (mounted) {
         setState(
           () => _state = earlyFrames.isEmpty
@@ -329,6 +340,8 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       return;
     }
     if (frame.type != frameData) return;
+    _receivedPayloadBytes += frame.payload.length;
+    _updateTransferSpeed();
     final manifest = _manifest;
     final fountain = _fountain;
     if (manifest == null || fountain == null) {
@@ -344,6 +357,26 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       _savingTransfer = true;
       unawaited(_finish(fountain, manifest));
     }
+  }
+
+  void _updateTransferSpeed() {
+    if (_fountain == null || _manifest == null) return;
+    final now = DateTime.now();
+    final bytes = _receivedPayloadBytes;
+    final previous = _lastSpeedSample;
+    if (previous == null) {
+      _lastSpeedSample = now;
+      _lastSpeedBytes = bytes;
+      return;
+    }
+    final seconds = now.difference(previous).inMicroseconds / 1000000;
+    if (seconds < 0.75) return;
+    final instant = math.max(0, bytes - _lastSpeedBytes) / seconds;
+    _transferBytesPerSecond = _transferBytesPerSecond == 0
+        ? instant
+        : _transferBytesPerSecond * 0.65 + instant * 0.35;
+    _lastSpeedSample = now;
+    _lastSpeedBytes = bytes;
   }
 
   Future<void> _finish(
@@ -396,6 +429,10 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       _validFrames = 0;
       _savingTransfer = false;
       _decoderError = null;
+      _lastSpeedSample = null;
+      _lastSpeedBytes = 0;
+      _receivedPayloadBytes = 0;
+      _transferBytesPerSecond = 0;
       _state = 'وجّه الكاميرا نحو مصفوفتَي LumaLink';
     });
     final camera = _camera;
@@ -438,6 +475,17 @@ class _ReceiverScreenState extends State<ReceiverScreen>
     final progress = fountain == null || _manifest == null
         ? 0.0
         : fountain.uniqueChunks / _manifest!.k;
+    final receivedBytes = fountain == null || _manifest == null
+        ? 0
+        : math.min(
+            _manifest!.compressedBytes,
+            fountain.uniqueChunks * _manifest!.chunkSize,
+          );
+    final remainingSeconds = _transferBytesPerSecond <= 0 || _manifest == null
+        ? null
+        : ((_manifest!.compressedBytes - receivedBytes) /
+                  _transferBytesPerSecond)
+              .ceil();
     return Directionality(
       textDirection: TextDirection.rtl,
       child: Scaffold(
@@ -462,16 +510,9 @@ class _ReceiverScreenState extends State<ReceiverScreen>
                   _StatusCard(
                     state: _state,
                     progress: progress,
-                    chunks: fountain?.uniqueChunks ?? 0,
-                    total: _manifest?.k ?? 0,
-                    equations: fountain?.receivedEquations ?? 0,
-                    validFrames: _validFrames,
-                    captureFps: _captureFps,
-                    senderFps: _senderFps,
-                    decodeMs: _decodeMs,
-                    turbo: _barcodes.any((value) => value?.lanes == 2),
-                    bufferedFrames: _pendingData.length,
-                    decoderError: _decoderError,
+                    transferStarted: _manifest != null,
+                    bytesPerSecond: _transferBytesPerSecond,
+                    remainingSeconds: remainingSeconds,
                   ),
                 ],
               ),
@@ -550,24 +591,30 @@ class _StatusCard extends StatelessWidget {
   const _StatusCard({
     required this.state,
     required this.progress,
-    required this.chunks,
-    required this.total,
-    required this.equations,
-    required this.validFrames,
-    required this.captureFps,
-    required this.senderFps,
-    required this.decodeMs,
-    required this.turbo,
-    required this.bufferedFrames,
-    required this.decoderError,
+    required this.transferStarted,
+    required this.bytesPerSecond,
+    required this.remainingSeconds,
   });
   final String state;
   final double progress;
-  final int chunks, total, equations, validFrames;
-  final double captureFps, senderFps, decodeMs;
-  final bool turbo;
-  final int bufferedFrames;
-  final String? decoderError;
+  final bool transferStarted;
+  final double bytesPerSecond;
+  final int? remainingSeconds;
+
+  String get _speed {
+    if (bytesPerSecond >= 1024 * 1024) {
+      return '${(bytesPerSecond / (1024 * 1024)).toStringAsFixed(1)} ميگابايت/ث';
+    }
+    return '${(bytesPerSecond / 1024).toStringAsFixed(1)} كيلوبايت/ث';
+  }
+
+  String get _remaining {
+    final seconds = remainingSeconds;
+    if (seconds == null || seconds <= 0) return 'جاري حساب الوقت المتبقي';
+    if (seconds < 60) return 'متبقي تقريباً $seconds ثانية';
+    final minutes = (seconds / 60).ceil();
+    return 'متبقي تقريباً $minutes دقيقة';
+  }
 
   @override
   Widget build(BuildContext context) => Container(
@@ -586,7 +633,7 @@ class _StatusCard extends StatelessWidget {
           textAlign: TextAlign.center,
           style: const TextStyle(fontWeight: FontWeight.w700),
         ),
-        if (total > 0) ...[
+        if (transferStarted) ...[
           const SizedBox(height: 12),
           LinearProgressIndicator(
             value: progress.clamp(0, 1),
@@ -595,30 +642,20 @@ class _StatusCard extends StatelessWidget {
           ),
           const SizedBox(height: 7),
           Text(
-            '${(progress * 100).toStringAsFixed(1)}%  •  $chunks / $total  •  $equations معادلة',
+            '${(progress * 100).toStringAsFixed(1)}%',
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
           ),
+          const SizedBox(height: 8),
+          Text(
+            'سرعة النقل: $_speed',
+            style: const TextStyle(
+              color: Color(0xff65f1df),
+              fontSize: 17,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          Text(_remaining, style: const TextStyle(color: Colors.white70)),
         ],
-        const SizedBox(height: 10),
-        Text(
-          '${turbo ? 'Turbo ×2' : 'مسار واحد'}  •  إرسال ${senderFps.toStringAsFixed(1)}fps  •  كاميرا ${captureFps.toStringAsFixed(1)}fps',
-        ),
-        Text(
-          'فك ${decodeMs.toStringAsFixed(0)}ms  •  إطارات صحيحة $validFrames',
-          style: const TextStyle(color: Colors.white70, fontSize: 12),
-        ),
-        if (total == 0 && bufferedFrames > 0)
-          Text(
-            'حزم بيانات محفوظة بانتظار معلومات الملف: $bufferedFrames',
-            style: const TextStyle(color: Color(0xffffd166), fontSize: 12),
-          ),
-        if (decoderError != null)
-          Text(
-            'خطأ فك الترميز: $decoderError',
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: Color(0xffff7b7b), fontSize: 11),
-          ),
       ],
     ),
   );
