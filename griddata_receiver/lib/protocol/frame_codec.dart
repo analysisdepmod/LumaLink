@@ -81,6 +81,35 @@ Uint8List _bitsToBytes(Uint8List bits) {
   return bytes;
 }
 
+class _FrameDecodePlan {
+  const _FrameDecodePlan({
+    required this.messageBytes,
+    required this.code,
+    required this.permutation,
+    required this.mask,
+  });
+  final int messageBytes;
+  final LdpcCode code;
+  final List<int> permutation;
+  final Uint8List mask;
+}
+
+final Map<(int, int), _FrameDecodePlan> _frameDecodePlans =
+    <(int, int), _FrameDecodePlan>{};
+
+_FrameDecodePlan _decodePlan(int capacity, double rate) {
+  final messageBytes = messageBytesFor(capacity, rate);
+  return _frameDecodePlans.putIfAbsent((capacity, messageBytes), () {
+    final code = makeLdpcKm(messageBytes * 8, capacity * 8 - messageBytes * 8);
+    return _FrameDecodePlan(
+      messageBytes: messageBytes,
+      code: code,
+      permutation: _permutation(capacity),
+      mask: _whiteningMask(code.n),
+    );
+  });
+}
+
 Uint8List _bytesToBits(Uint8List bytes) {
   final bits = Uint8List(bytes.length * 8);
   for (var i = 0; i < bytes.length; i++) {
@@ -122,9 +151,10 @@ DecodedFrame? decodeFrameLlr(
   int iterations = 24,
 }) {
   if (capacity < 1 || transmittedLlr.length < capacity * 8) return null;
-  final messageBytes = messageBytesFor(capacity, rate);
-  final code = makeLdpcKm(messageBytes * 8, capacity * 8 - messageBytes * 8);
-  final permutation = _permutation(capacity);
+  final plan = _decodePlan(capacity, rate);
+  final messageBytes = plan.messageBytes;
+  final code = plan.code;
+  final permutation = plan.permutation;
   final codewordLlr = Float64List(code.n);
   for (var byte = 0; byte < capacity; byte++) {
     final source = byte * 8;
@@ -133,7 +163,7 @@ DecodedFrame? decodeFrameLlr(
       codewordLlr[destination + bit] = transmittedLlr[source + bit];
     }
   }
-  final mask = _whiteningMask(code.n);
+  final mask = plan.mask;
   for (var bit = 0; bit < code.n; bit++) {
     if (mask[bit] == 1) codewordLlr[bit] = -codewordLlr[bit];
   }

@@ -51,6 +51,9 @@ class ReceiverScreen extends StatefulWidget {
 
 class _ReceiverScreenState extends State<ReceiverScreen>
     with WidgetsBindingObserver {
+  static const MethodChannel _filesChannel = MethodChannel(
+    'com.griddata.griddata_receiver/files',
+  );
   CameraController? _camera;
   String _state = 'جاري تشغيل الكاميرا…';
   double _captureFps = 0;
@@ -60,8 +63,9 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   int _windowFrames = 0;
   int _nextDecodeUs = 0;
   DateTime _windowStarted = DateTime.now();
-  bool _busy = false;
   bool _torch = false;
+  int _decoderWorkerCount = 0;
+  int _deviceMemoryMb = 0;
   static const int _maxPendingDataFrames = 192;
   final List<BarcodeData?> _barcodes = <BarcodeData?>[null, null];
   final List<int> _lastTicks = <int>[-1, -1];
@@ -71,8 +75,10 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   FountainDecoder? _fountain;
   bool _savingTransfer = false;
   final ReceivePort _decodeReplies = ReceivePort();
-  SendPort? _decodeRequests;
-  Isolate? _decodeIsolate;
+  final List<SendPort?> _decodeRequests = <SendPort?>[];
+  final List<Isolate?> _decodeIsolates = <Isolate?>[];
+  final List<bool> _decoderBusy = <bool>[];
+  int _nextDecoderWorker = 0;
   int _decodeRequestId = 0;
   String? _decoderError;
   DateTime _lastDiagnosticLog = DateTime.fromMillisecondsSinceEpoch(0);
@@ -82,6 +88,8 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   int _lastSpeedBytes = 0;
   int _receivedPayloadBytes = 0;
   double _transferBytesPerSecond = 0;
+  File? _completedFile;
+  bool _retainingFile = false;
 
   @override
   void initState() {
@@ -93,11 +101,33 @@ class _ReceiverScreenState extends State<ReceiverScreen>
 
   Future<void> _startDecoder() async {
     _decodeReplies.listen(_onDecodeMessage);
-    _decodeIsolate = await Isolate.spawn(
-      nativeDecodeWorkerEntry,
-      _decodeReplies.sendPort,
-      debugName: 'LumaLink native optical decoder',
-    );
+    final cores = Platform.numberOfProcessors;
+    try {
+      final memInfo = await File('/proc/meminfo').readAsString();
+      final match = RegExp(r'MemTotal:\s+(\d+)\s+kB').firstMatch(memInfo);
+      _deviceMemoryMb = (int.tryParse(match?.group(1) ?? '') ?? 0) ~/ 1024;
+    } catch (_) {
+      _deviceMemoryMb = 0;
+    }
+    _decoderWorkerCount = switch ((cores, _deviceMemoryMb)) {
+      (>= 10, >= 10000) => 4,
+      (>= 8, >= 5500) => 3,
+      (>= 6, >= 3000) => 2,
+      _ => 1,
+    };
+    _decodeRequests.addAll(List<SendPort?>.filled(_decoderWorkerCount, null));
+    _decodeIsolates.addAll(List<Isolate?>.filled(_decoderWorkerCount, null));
+    _decoderBusy.addAll(List<bool>.filled(_decoderWorkerCount, false));
+    for (var workerId = 0; workerId < _decoderWorkerCount; workerId++) {
+      _decodeIsolates[workerId] = await Isolate.spawn<Object>(
+        nativeDecodeWorkerEntry,
+        <String, Object?>{
+          'parent': _decodeReplies.sendPort,
+          'workerId': workerId,
+        },
+        debugName: 'LumaLink optical decoder ${workerId + 1}',
+      );
+    }
   }
 
   Future<void> _persistDiagnostic(String line) async {
@@ -166,14 +196,24 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       _windowFrames = 0;
       _windowStarted = DateTime.now();
     }
-    final decoder = _decodeRequests;
-    if (_busy || decoder == null || image.planes.length < 3) return;
+    if (image.planes.length < 3) return;
+    var workerId = -1;
+    for (var offset = 0; offset < _decoderWorkerCount; offset++) {
+      final candidate = (_nextDecoderWorker + offset) % _decoderWorkerCount;
+      if (!_decoderBusy[candidate] && _decodeRequests[candidate] != null) {
+        workerId = candidate;
+        break;
+      }
+    }
+    if (workerId < 0) return;
     final nowUs = DateTime.now().microsecondsSinceEpoch;
-    // Synchronize native capture with the sender's CRC-protected timing row.
+    // Feed every available decoder core. The CRC-protected timing row rejects
+    // repeated camera looks at the same displayed frame.
     if (nowUs < _nextDecodeUs) return;
-    _nextDecodeUs = nowUs + (1000000 / _senderFps.clamp(2, 30)).round();
-    _busy = true;
-    decoder.send(<String, Object?>{
+    _nextDecodeUs = nowUs + 30000;
+    _decoderBusy[workerId] = true;
+    _nextDecoderWorker = (workerId + 1) % _decoderWorkerCount;
+    _decodeRequests[workerId]!.send(<String, Object?>{
       'id': ++_decodeRequestId,
       'width': image.width,
       'height': image.height,
@@ -189,16 +229,28 @@ class _ReceiverScreenState extends State<ReceiverScreen>
           .map((value) => value == null ? null : barcodeToMessage(value))
           .toList(),
       'lastTicks': List<int>.from(_lastTicks),
+      if (_barcodes.any((value) => value?.lanes == 2))
+        'preferredLane': workerId % 2,
     });
   }
 
   void _onDecodeMessage(Object? message) {
-    if (message is SendPort) {
-      _decodeRequests = message;
+    if (message is Map && message['ready'] == true) {
+      final workerId = message['workerId'];
+      final port = message['port'];
+      if (workerId is int &&
+          workerId >= 0 &&
+          workerId < _decoderWorkerCount &&
+          port is SendPort) {
+        _decodeRequests[workerId] = port;
+      }
       return;
     }
     if (message is! Map) return;
-    _busy = false;
+    final workerId = message['workerId'];
+    if (workerId is int && workerId >= 0 && workerId < _decoderWorkerCount) {
+      _decoderBusy[workerId] = false;
+    }
     _decodeMs = (message['ms'] as num?)?.toDouble() ?? 0;
     final workerError = message['error'];
     if (workerError is String && workerError.isNotEmpty) {
@@ -221,6 +273,7 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       if (type is! int || seed is! int || payload is! TransferableTypedData)
         continue;
       final tick = value['tick'];
+      if (tick is int && _lastTicks[lane] == tick) continue;
       if (tick is int) _lastTicks[lane] = tick;
       _validFrames++;
       _decoderError = null;
@@ -238,6 +291,11 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       _lastDiagnosticLog = now;
       final diagnosticLine = jsonEncode(<String, Object?>{
         'request': message['id'],
+        'workerId': workerId,
+        'workerPool': _decoderWorkerCount,
+        'busyWorkers': _decoderBusy.where((busy) => busy).length,
+        'deviceCores': Platform.numberOfProcessors,
+        'deviceMemoryMb': _deviceMemoryMb,
         'decodeMs': _decodeMs,
         'locked': message['locked'] == true,
         'worker': message['diagnostic'],
@@ -329,8 +387,8 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       if (mounted) {
         setState(
           () => _state = earlyFrames.isEmpty
-              ? 'بدأ الاستلام: ${manifest.name}'
-              : 'بدأ الاستلام: ${manifest.name} — استُعيدت ${earlyFrames.length} حزمة مبكرة',
+              ? 'بدأ استلام الملف'
+              : 'بدأ الاستلام — تمت استعادة الحزم المبكرة',
         );
       }
       if (_fountain!.isComplete) {
@@ -352,7 +410,7 @@ class _ReceiverScreenState extends State<ReceiverScreen>
     }
     if (_savingTransfer) return;
     fountain.addFrame(frame.seed, frame.payload);
-    if (mounted) setState(() => _state = 'استلام ${manifest.name}');
+    if (mounted) setState(() => _state = 'جاري استلام الملف');
     if (fountain.isComplete) {
       _savingTransfer = true;
       unawaited(_finish(fountain, manifest));
@@ -397,12 +455,45 @@ class _ReceiverScreenState extends State<ReceiverScreen>
         () => finishTransfer(reconstructed, manifest),
       );
       final file = await saveTransfer(bytes, manifest);
-      if (mounted)
-        setState(() => _state = 'اكتمل النقل وتحقق SHA-256\n${file.path}');
+      if (mounted) {
+        setState(() {
+          _completedFile = file;
+          _state = 'اكتمل النقل وتم التحقق من الملف';
+        });
+      }
     } catch (error) {
       if (mounted) setState(() => _state = 'فشل التحقق: $error');
     } finally {
       _savingTransfer = false;
+    }
+  }
+
+  Future<void> _retainCompletedFile() async {
+    final file = _completedFile;
+    final manifest = _manifest;
+    if (file == null || manifest == null || _retainingFile) return;
+    setState(() => _retainingFile = true);
+    try {
+      final saved = await _filesChannel.invokeMethod<bool>('saveCopy', {
+        'sourcePath': file.path,
+        'name': manifest.name,
+        'mime': manifest.mime,
+      });
+      if (mounted && saved == true) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('تم حفظ نسخة من الملف')));
+      }
+    } on PlatformException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('تعذّر حفظ النسخة: ${error.message ?? error.code}'),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _retainingFile = false);
     }
   }
 
@@ -433,6 +524,8 @@ class _ReceiverScreenState extends State<ReceiverScreen>
       _lastSpeedBytes = 0;
       _receivedPayloadBytes = 0;
       _transferBytesPerSecond = 0;
+      _completedFile = null;
+      _retainingFile = false;
       _state = 'وجّه الكاميرا نحو مصفوفتَي LumaLink';
     });
     final camera = _camera;
@@ -463,7 +556,9 @@ class _ReceiverScreenState extends State<ReceiverScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     unawaited(_camera?.dispose());
-    _decodeIsolate?.kill(priority: Isolate.immediate);
+    for (final isolate in _decodeIsolates) {
+      isolate?.kill(priority: Isolate.immediate);
+    }
     _decodeReplies.close();
     super.dispose();
   }
@@ -509,10 +604,15 @@ class _ReceiverScreenState extends State<ReceiverScreen>
                   const Spacer(),
                   _StatusCard(
                     state: _state,
+                    fileName: _manifest?.name,
+                    totalBytes: _manifest?.total,
                     progress: progress,
                     transferStarted: _manifest != null,
                     bytesPerSecond: _transferBytesPerSecond,
                     remainingSeconds: remainingSeconds,
+                    completed: _completedFile != null,
+                    retaining: _retainingFile,
+                    onRetain: _retainCompletedFile,
                   ),
                 ],
               ),
@@ -590,16 +690,26 @@ class _Header extends StatelessWidget {
 class _StatusCard extends StatelessWidget {
   const _StatusCard({
     required this.state,
+    required this.fileName,
+    required this.totalBytes,
     required this.progress,
     required this.transferStarted,
     required this.bytesPerSecond,
     required this.remainingSeconds,
+    required this.completed,
+    required this.retaining,
+    required this.onRetain,
   });
   final String state;
+  final String? fileName;
+  final int? totalBytes;
   final double progress;
   final bool transferStarted;
   final double bytesPerSecond;
   final int? remainingSeconds;
+  final bool completed;
+  final bool retaining;
+  final VoidCallback onRetain;
 
   String get _speed {
     if (bytesPerSecond >= 1024 * 1024) {
@@ -616,6 +726,25 @@ class _StatusCard extends StatelessWidget {
     return 'متبقي تقريباً $minutes دقيقة';
   }
 
+  String get _fileSize {
+    final bytes = totalBytes ?? 0;
+    if (bytes >= 1024 * 1024 * 1024) {
+      return '${_short(bytes / (1024 * 1024 * 1024))} GB';
+    }
+    if (bytes >= 1024 * 1024) {
+      return '${_short(bytes / (1024 * 1024))} MB';
+    }
+    if (bytes >= 1024) {
+      return '${_short(bytes / 1024)} KB';
+    }
+    return '$bytes B';
+  }
+
+  String _short(double value) {
+    final text = value.toStringAsFixed(value >= 10 ? 0 : 1);
+    return text.endsWith('.0') ? text.substring(0, text.length - 2) : text;
+  }
+
   @override
   Widget build(BuildContext context) => Container(
     margin: const EdgeInsets.all(12),
@@ -628,6 +757,21 @@ class _StatusCard extends StatelessWidget {
     child: Column(
       mainAxisSize: MainAxisSize.min,
       children: [
+        if (fileName != null) ...[
+          Text(
+            '$fileName  •  $_fileSize',
+            textDirection: TextDirection.ltr,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: Color(0xff65f1df),
+              fontSize: 16,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(height: 6),
+        ],
         Text(
           state,
           textAlign: TextAlign.center,
@@ -646,15 +790,29 @@ class _StatusCard extends StatelessWidget {
             style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
           ),
           const SizedBox(height: 8),
-          Text(
-            'سرعة النقل: $_speed',
-            style: const TextStyle(
-              color: Color(0xff65f1df),
-              fontSize: 17,
-              fontWeight: FontWeight.w700,
+          if (!completed) ...[
+            Text(
+              'سرعة النقل: $_speed',
+              style: const TextStyle(
+                color: Color(0xff65f1df),
+                fontSize: 17,
+                fontWeight: FontWeight.w700,
+              ),
             ),
-          ),
-          Text(_remaining, style: const TextStyle(color: Colors.white70)),
+            Text(_remaining, style: const TextStyle(color: Colors.white70)),
+          ] else ...[
+            const SizedBox(height: 4),
+            FilledButton.icon(
+              onPressed: retaining ? null : onRetain,
+              icon: retaining
+                  ? const SizedBox.square(
+                      dimension: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.save_alt),
+              label: Text(retaining ? 'جاري الحفظ…' : 'حفظ نسخة بالجهاز'),
+            ),
+          ],
         ],
       ],
     ),

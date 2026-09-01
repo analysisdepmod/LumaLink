@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'meta_barcode.dart';
@@ -27,6 +28,157 @@ class Color8Grid {
   final Float32List green;
   final Float32List blue;
   final Float32List reliability;
+}
+
+double _neighbourCorrelation(
+  Float32List values,
+  int gridWidth,
+  int gridHeight,
+  int from,
+) {
+  var sum = 0.0, sumSquared = 0.0, count = 0;
+  for (var i = from; i < values.length; i++) {
+    final value = values[i];
+    sum += value;
+    sumSquared += value * value;
+    count++;
+  }
+  if (count < 16) return 0;
+  final mean = sum / count;
+  final variance = sumSquared / count - mean * mean;
+  if (variance <= 16) return 0;
+  var covariance = 0.0, pairs = 0;
+  for (var y = 0; y < gridHeight; y++) {
+    for (var x = 0; x < gridWidth; x++) {
+      final i = y * gridWidth + x;
+      if (i < from) continue;
+      final centered = values[i] - mean;
+      if (x + 1 < gridWidth && i + 1 >= from) {
+        covariance += centered * (values[i + 1] - mean);
+        pairs++;
+      }
+      if (y + 1 < gridHeight && i + gridWidth >= from) {
+        covariance += centered * (values[i + gridWidth] - mean);
+        pairs++;
+      }
+    }
+  }
+  return pairs == 0 ? 0 : covariance / pairs / variance;
+}
+
+double estimateColor8SpatialBlur(Color8Grid grid) {
+  final from = grid.gridWidth * barcodeRows;
+  final correlation =
+      (_neighbourCorrelation(grid.red, grid.gridWidth, grid.gridHeight, from) +
+          _neighbourCorrelation(
+            grid.green,
+            grid.gridWidth,
+            grid.gridHeight,
+            from,
+          ) +
+          _neighbourCorrelation(
+            grid.blue,
+            grid.gridWidth,
+            grid.gridHeight,
+            from,
+          )) /
+      3;
+  return ((correlation - 0.08) * 0.82).clamp(0, 0.34).toDouble();
+}
+
+/// Allocation-bounded port of the browser's blind spatial equalizer. The
+/// whitened payload should have no neighbour correlation, so measured positive
+/// correlation estimates camera/display blur and drives a bounded inverse filter.
+class Color8SpatialEqualizer {
+  Float32List _red = Float32List(0);
+  Float32List _green = Float32List(0);
+  Float32List _blue = Float32List(0);
+  Float32List _temporary = Float32List(0);
+
+  void _ensure(int length) {
+    if (_red.length == length) return;
+    _red = Float32List(length);
+    _green = Float32List(length);
+    _blue = Float32List(length);
+    _temporary = Float32List(length);
+  }
+
+  void _sharpen(
+    Float32List source,
+    Float32List output,
+    int width,
+    int height,
+    int from,
+    double strength,
+  ) {
+    var low = double.infinity, high = double.negativeInfinity;
+    for (var i = from; i < source.length; i++) {
+      low = math.min(low, source[i]);
+      high = math.max(high, source[i]);
+      output[i] = source[i];
+    }
+    for (var i = 0; i < from; i++) output[i] = source[i];
+    final padding = math.max(4, (high - low) * 0.08);
+    final minimum = low - padding, maximum = high + padding;
+    final spill = math.min(0.49, strength * 1.6);
+    final iterations = strength > 0.18 ? 3 : (strength > 0.09 ? 2 : 1);
+    for (var iteration = 0; iteration < iterations; iteration++) {
+      for (var y = 0; y < height; y++) {
+        for (var x = 0; x < width; x++) {
+          final i = y * width + x;
+          if (i < from ||
+              x == 0 ||
+              x + 1 == width ||
+              y == 0 ||
+              y + 1 == height) {
+            _temporary[i] = output[i];
+            continue;
+          }
+          final neighbours =
+              (output[i - 1] +
+                  output[i + 1] +
+                  output[i - width] +
+                  output[i + width]) /
+              4;
+          _temporary[i] = (1 - spill) * output[i] + spill * neighbours;
+        }
+      }
+      for (var y = 1; y + 1 < height; y++) {
+        for (var x = 1; x + 1 < width; x++) {
+          final i = y * width + x;
+          if (i < from) continue;
+          output[i] = (output[i] + source[i] - _temporary[i])
+              .clamp(minimum, maximum)
+              .toDouble();
+        }
+      }
+    }
+  }
+
+  Color8Grid apply(Color8Grid grid, double strength) {
+    if (strength < 0.025) return grid;
+    final length = grid.gridWidth * grid.gridHeight;
+    _ensure(length);
+    final from = grid.gridWidth * barcodeRows;
+    _sharpen(grid.red, _red, grid.gridWidth, grid.gridHeight, from, strength);
+    _sharpen(
+      grid.green,
+      _green,
+      grid.gridWidth,
+      grid.gridHeight,
+      from,
+      strength,
+    );
+    _sharpen(grid.blue, _blue, grid.gridWidth, grid.gridHeight, from, strength);
+    return Color8Grid(
+      gridWidth: grid.gridWidth,
+      gridHeight: grid.gridHeight,
+      red: _red,
+      green: _green,
+      blue: _blue,
+      reliability: grid.reliability,
+    );
+  }
 }
 
 int color8CapacityBytes(int gridWidth, int gridHeight) {

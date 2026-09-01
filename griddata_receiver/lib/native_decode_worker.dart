@@ -1,4 +1,5 @@
 import 'dart:isolate';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'protocol/color8.dart';
@@ -41,9 +42,30 @@ BarcodeData? barcodeFromMessage(Object? value) {
 /// Long-lived decoder isolate. Camera buffers are transferred into this isolate
 /// and all locator, YUV, demodulation and LDPC work happens away from Flutter's
 /// raster/UI isolate, keeping CameraPreview fluid while a matrix is visible.
-void nativeDecodeWorkerEntry(SendPort parent) {
+void nativeDecodeWorkerEntry(Object bootstrap) {
+  final legacy = bootstrap is SendPort;
+  final parent = legacy
+      ? bootstrap
+      : (bootstrap as Map<Object?, Object?>)['parent'] as SendPort;
+  final workerId = legacy
+      ? 0
+      : (bootstrap as Map<Object?, Object?>)['workerId'] as int;
   final inbox = ReceivePort();
-  parent.send(inbox.sendPort);
+  final trackedFrames = <MatrixRect?>[null, null];
+  final trackedAges = <int>[0, 0];
+  final spatialEqualizer = Color8SpatialEqualizer();
+  var spatialBlur = 0.0;
+  var spatialSamples = 0;
+  var spatialKey = '';
+  if (legacy) {
+    parent.send(inbox.sendPort);
+  } else {
+    parent.send(<String, Object?>{
+      'ready': true,
+      'workerId': workerId,
+      'port': inbox.sendPort,
+    });
+  }
   inbox.listen((message) {
     if (message is! Map) return;
     final watch = Stopwatch()..start();
@@ -86,13 +108,58 @@ void nativeDecodeWorkerEntry(SendPort parent) {
       var decodedManifest = 0;
       var decodedData = 0;
       var duplicateFrames = 0;
-      final indexedOuters = outers.indexed.toList(growable: false);
-      final refinedOuters = indexedOuters
+      var trackedReuse = 0;
+      bool compatible(MatrixRect current, MatrixRect tracked) {
+        final currentX = current.left + current.width / 2;
+        final currentY = current.top + current.height / 2;
+        final trackedX = tracked.left + tracked.width / 2;
+        final trackedY = tracked.top + tracked.height / 2;
+        final scale = math.min(current.width, current.height);
+        final positionOk =
+            math.sqrt(
+              math.pow(currentX - trackedX, 2) +
+                  math.pow(currentY - trackedY, 2),
+            ) <
+            scale * 0.06;
+        final widthOk = (current.width - tracked.width).abs() < scale * 0.15;
+        final heightOk = (current.height - tracked.height).abs() < scale * 0.15;
+        return positionOk && widthOk && heightOk;
+      }
+
+      final indexedOuters = outers.indexed
+          .map((entry) {
+            final visualIndex = entry.$1;
+            final outer = entry.$2;
+            if (outer.refined) {
+              trackedFrames[visualIndex] = outer;
+              trackedAges[visualIndex] = 0;
+              return entry;
+            }
+            final tracked = trackedFrames[visualIndex];
+            if (tracked != null &&
+                trackedAges[visualIndex] < 4 &&
+                compatible(outer, tracked)) {
+              trackedAges[visualIndex]++;
+              trackedReuse++;
+              return (visualIndex, tracked);
+            }
+            trackedFrames[visualIndex] = null;
+            trackedAges[visualIndex] = 0;
+            return entry;
+          })
+          .toList(growable: false);
+      final preferredLane = message['preferredLane'] as int?;
+      final laneOuters = preferredLane == null
+          ? indexedOuters
+          : indexedOuters
+                .where((entry) => entry.$1 == preferredLane)
+                .toList(growable: false);
+      final refinedOuters = laneOuters
           .where((entry) => entry.$2.refined)
           .toList(growable: false);
       final decodeTargets = refinedOuters.isNotEmpty
           ? refinedOuters
-          : indexedOuters.take(1);
+          : laneOuters.take(1);
       for (final (visualIndex, outer) in decodeTargets) {
         final found = locateBarcode(frame.luma, outer);
         final barcode = found ?? known[visualIndex];
@@ -118,7 +185,22 @@ void nativeDecodeWorkerEntry(SendPort parent) {
           continue;
         }
         sampledFrames++;
-        final sampled = sampleColor8(frame, outer, barcode);
+        var sampled = sampleColor8(frame, outer, barcode);
+        if (barcode.encoding == GridEncoding.color8) {
+          final key = '${barcode.gridWidth}x${barcode.gridHeight}';
+          if (key != spatialKey) {
+            spatialKey = key;
+            spatialBlur = 0;
+            spatialSamples = 0;
+          }
+          final instant = estimateColor8SpatialBlur(sampled);
+          final alpha = spatialSamples < 8 ? 0.30 : 0.075;
+          spatialBlur = spatialSamples == 0
+              ? instant
+              : spatialBlur + (instant - spatialBlur) * alpha;
+          spatialSamples++;
+          sampled = spatialEqualizer.apply(sampled, spatialBlur);
+        }
         final capacity = switch (barcode.encoding) {
           GridEncoding.bw => bwCapacityBytes(
             barcode.gridWidth,
@@ -164,6 +246,7 @@ void nativeDecodeWorkerEntry(SendPort parent) {
       }
       watch.stop();
       parent.send(<String, Object?>{
+        'workerId': workerId,
         'id': message['id'],
         'ms': watch.elapsedMicroseconds / 1000,
         'locked': locked,
@@ -174,6 +257,8 @@ void nativeDecodeWorkerEntry(SendPort parent) {
               '${frame.yRowStride}/${frame.uRowStride}/${frame.vRowStride}',
           'outers': outers.length,
           'finderRefined': outers.where((outer) => outer.refined).length,
+          'trackedReuse': trackedReuse,
+          'preferredLane': preferredLane,
           'freshBarcodes': freshBarcodes,
           'fallbackBarcodes': fallbackBarcodes,
           'timingRows': timingRows,
@@ -183,11 +268,13 @@ void nativeDecodeWorkerEntry(SendPort parent) {
           'data': decodedData,
           'duplicates': duplicateFrames,
           'uvOrder': 'YUV',
+          'spatialBlur': spatialBlur,
         },
       });
     } catch (error) {
       watch.stop();
       parent.send(<String, Object?>{
+        'workerId': workerId,
         'id': message['id'],
         'ms': watch.elapsedMicroseconds / 1000,
         'locked': false,
