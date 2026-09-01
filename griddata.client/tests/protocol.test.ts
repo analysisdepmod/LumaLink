@@ -110,6 +110,49 @@ test('Fast 72x72 completes a clean end-to-end v10 transfer', async () => {
   assert.deepEqual(await finishTransfer(decoder.reconstruct(), built.manifest), raw)
 })
 
+test('Turbo medium transfers publish a redundant manifest checkpoint at most every 64 payload frames', async () => {
+  const spec: EncodingSpec = { enc: 'color8', gridW: 72, gridH: 72, rate: 0.625 }
+  const raw = new Uint8Array(80_000)
+  let state = 0x51a7e123
+  for (let i = 0; i < raw.length; i++) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0
+    raw[i] = state >>> 24
+  }
+  const built = await buildTransfer(raw, { kind: 'file', name: 'checkpoint.bin', mime: 'application/octet-stream' }, {
+    spec, chunkSize: maxPayload(spec), frameCount: 1, fps: 12, lanes: 2,
+  })
+  const capacity = capacityBytes(spec)
+  const types: number[] = []
+  for (let index = 0; index < built.frameCount; index++) {
+    const frame = built.frameAt(index)
+    const llr = new Float32Array(capacity * 8)
+    for (let byte = 0; byte < frame.length; byte++) for (let bit = 0; bit < 8; bit++)
+      llr[byte * 8 + bit] = frame[byte] & (1 << (7 - bit)) ? -12 : 12
+    const parsed = parseFrameLdpcSoft(llr, capacity, spec.rate)
+    assert.ok(parsed)
+    types.push(parsed!.type)
+  }
+  const firstData = types.indexOf(FRAME_TYPE_DATA)
+  assert.ok(firstData >= 0)
+  let dataRun = 0
+  let maxDataRun = 0
+  const checkpointRuns: number[] = []
+  for (let index = firstData; index < types.length; index++) {
+    if (types[index] === FRAME_TYPE_DATA) {
+      dataRun++
+      maxDataRun = Math.max(maxDataRun, dataRun)
+    } else {
+      dataRun = 0
+      let run = 1
+      while (index + 1 < types.length && types[index + 1] !== FRAME_TYPE_DATA) { run++; index++ }
+      checkpointRuns.push(run)
+    }
+  }
+  assert.ok(maxDataRun <= 64)
+  assert.ok(checkpointRuns.length > 0)
+  assert.ok(checkpointRuns.every(run => run >= 2))
+})
+
 test('Fast 72x72 centred 3x3 camera sampler preserves an LDPC frame under sensor noise', () => {
   const spec: EncodingSpec = { enc: 'color8', gridW: 72, gridH: 72, rate: 0.625 }
   const capacity = capacityBytes(spec)

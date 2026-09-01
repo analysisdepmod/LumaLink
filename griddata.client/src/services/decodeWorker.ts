@@ -765,7 +765,11 @@ function reply(r: Omit<DecodeReply, 'ms' | 'wasm' | 'spatialSimd' | 'webGpu' | '
         t: trackState.t,
       }
     : undefined
-  ;(self as unknown as Worker).postMessage({ ...r, ms: performance.now() - t0, wasm: wasmActive, spatialSimd: spatialSimdActive, webGpu: curWebGpu, gpuSampleMs: curGpuSampleMs, webGpuStatus: gpuStatus, webGpuReason: gpuReason, dark: curDark, quad: curQuad, tracked: curTracked, phase: curPhase, colorConfidence: curColorConfidence, superLooks: superRx?.count ?? 0, superWins, spatialBlur: curSpatialBlur, senderFps: curSenderFps, timingTick: curTimingTick, timingLane: curTimingLane, duplicateFrame: curDuplicateFrame, trackHint: sharedTrack })
+  // Keep publishing the authoritative optical contract after acquisition.  The
+  // old worker only sent it on the one lock transition; a manifest decoded by a
+  // later worker reply could therefore reach ReceivePage without the geometry
+  // required by the compact v6+ wire format.
+  ;(self as unknown as Worker).postMessage({ ...r, lockedSpec: r.lockedSpec ?? locked ?? undefined, ms: performance.now() - t0, wasm: wasmActive, spatialSimd: spatialSimdActive, webGpu: curWebGpu, gpuSampleMs: curGpuSampleMs, webGpuStatus: gpuStatus, webGpuReason: gpuReason, dark: curDark, quad: curQuad, tracked: curTracked, phase: curPhase, colorConfidence: curColorConfidence, superLooks: superRx?.count ?? 0, superWins, spatialBlur: curSpatialBlur, senderFps: curSenderFps, timingTick: curTimingTick, timingLane: curTimingLane, duplicateFrame: curDuplicateFrame, trackHint: sharedTrack })
 }
 
 function meanReliability(rel?: Float32Array): number | undefined {

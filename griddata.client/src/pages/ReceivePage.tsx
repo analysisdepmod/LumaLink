@@ -457,7 +457,7 @@ export default function ReceivePage() {
     return true
   }, [finish])
 
-    const onScan = useCallback((parsed: ParsedFrame | null) => {
+    const onScan = useCallback((parsed: ParsedFrame | null, optical?: EncodingSpec) => {
 
     if (doneRef.current) return
     attemptsRef.current++
@@ -481,7 +481,10 @@ export default function ReceivePage() {
     if (parsed.type === FRAME_TYPE_MANIFEST) {
       d.manifest++
       if (parsed.payload.length >= 2) d.parts = `${parsed.payload[0] + 1}/${parsed.payload[1]}`
-      const m = assemblerRef.current.add(parsed.payload, detectedRef.current ?? undefined)
+      // Prefer the spec attached to this exact decoded frame. Compact manifests
+      // omit optical geometry by design; using only the separately published
+      // detection ref made a valid late-join manifest occasionally return null.
+      const m = assemblerRef.current.add(parsed.payload, optical ?? detectedRef.current ?? undefined)
       if (!m) { d.manifestNull++; return }
       if (!isValidManifest(m)) { d.manifestInvalid++; return }
       if (!manifestRef.current || manifestRef.current.id !== m.id) {

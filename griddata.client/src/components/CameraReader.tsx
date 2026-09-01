@@ -11,7 +11,10 @@ interface Props {
     auto?: boolean        // let the worker auto-detect enc/grid/rate
     active: boolean
     manifest?: TransferManifest | null  // pass once decoded so the worker can derive zone map
-    onScan: (result: ParsedFrame | null) => void
+    // `optical` comes from the same worker reply as `result`.  A compact v6+
+    // manifest deliberately omits geometry/rate, so handing the exact spec to
+    // the consumer avoids waiting for a separate React detection update.
+    onScan: (result: ParsedFrame | null, optical?: EncodingSpec) => void
     onResolution?: (w: number, h: number, fps?: number) => void
     onStats?: (s: { looks: number; combinedWins: number; superLooks: number; superWins: number; ms: number; avgMs: number; maxMs: number; processed: number; wasm: boolean; spatialSimd: boolean; webGpu: boolean; gpuSampleMs: number; webGpuStatus: WebGpuStatus; webGpuReason: string; workerPool: number; turboPairs: number; captureTargetFps: number; timingFps: number; timingSkips: number; laneFrames: [number, number]; proc: number; tracked: number; phase: 'search' | 'bootstrap' | 'payload'; colorConfidence: number; spatialBlur: number; gpuCapture: boolean }) => void
     onDetect?: (spec: EncodingSpec) => void  // fires once auto-detect locks on
@@ -505,7 +508,8 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
             // A barcode-confirmed duplicate never entered LDPC, so it is neither
             // a valid nor a failed optical decode attempt. Keep benchmark rates
             // honest and expose it separately through timingSkips.
-            if (!e.data.duplicateFrame) onScanRef.current(found ? result : null)
+            if (!e.data.duplicateFrame)
+                onScanRef.current(found ? result : null, e.data.lockedSpec)
         }
         for (let i = 0; i < POOL; i++) {
             const wk = new Worker(new URL('../services/decodeWorker.ts', import.meta.url), { type: 'module' })

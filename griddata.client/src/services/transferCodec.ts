@@ -705,12 +705,13 @@ export async function buildTransfer(
   const manifestFrames = encodeManifestFrames(manifest, capacity, bootstrapRate)
   // The receiver can't decode ANYTHING until it has the manifest (K, chunk size,
   // spec). The leading copies provide an immediate lock-on for the normal flow.
-  // Afterwards, re-insert only every 96 data frames. The fixed metadata strip
-  // already locks the optical settings, while this transfer manifest is needed
-  // only once for K/file details. The 16-frame bootstrap below covers normal
-  // receiver-first use; a late receiver still waits at most about eight seconds
-  // on a single lane (half that in Turbo), and early data are buffered safely.
-  const manifestEvery = Math.max(4, opts.manifestEvery ?? 96)
+  // Afterwards, re-insert a compact checkpoint. A field run joined after the
+  // preamble, missed the one-frame checkpoint at 96, buffered 63 valid payload
+  // frames, then waited until the carousel wrapped (~8 s). Medium transfers can
+  // afford a checkpoint every 64 payload frames; larger transfers retain 96.
+  // Turbo repeats the checkpoint on both optical lanes below, so one weak lane
+  // cannot postpone manifest acquisition for an entire carousel.
+  const manifestEvery = Math.max(4, opts.manifestEvery ?? (k <= 1024 ? 64 : 96))
   // MUST emit at least ~K distinct fountain frames or the transfer can never
   // complete (the receiver needs ~K distinct seeds). A larger pool also means
   // fewer repeat captures → faster collection. So always ensure the recommended
@@ -734,7 +735,7 @@ export async function buildTransfer(
   const bootstrapOpticalFrames = Math.ceil((opts.fps ?? 6.5) * (opts.lanes ?? 1) * 1.5)
   const leadingManifestCount = manifestFrames.length * Math.max(10,
     Math.ceil(bootstrapOpticalFrames / manifestFrames.length))
-  const manifestBurst = manifestFrames.length
+  const manifestBurst = manifestFrames.length * (opts.lanes === 2 ? 2 : 1)
   // v9 returns to the field-proven alternating repair mapping. v8's every-wide
   // graph looked ideal under IID simulation but delayed peeling in two real
   // transfers (583/420 and 699/461 equations). The packed, timer-free 128-tail
