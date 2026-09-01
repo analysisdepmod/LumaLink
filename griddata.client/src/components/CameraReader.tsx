@@ -5,6 +5,8 @@ import { type EncodingSpec } from '../services/visualCodec'
 import { FRAME_TYPE_DATA, type ParsedFrame, type TransferManifest } from '../services/transferCodec'
 import { TIMING_STATE_WORDS } from '../services/timingClaims'
 import type { DecodeReply, NormQuad, TrackHint, WebGpuStatus } from '../services/decodeWorker'
+import type { OpticalLaneCount } from '../services/metaBarcode'
+import { TransferControlAssembler, type TransferControl } from '../services/controlBarcode'
 
 interface Props {
     spec?: EncodingSpec   // manual/locked spec; omit when auto === true
@@ -16,19 +18,20 @@ interface Props {
     // the consumer avoids waiting for a separate React detection update.
     onScan: (result: ParsedFrame | null, optical?: EncodingSpec) => void
     onResolution?: (w: number, h: number, fps?: number) => void
-    onStats?: (s: { looks: number; combinedWins: number; superLooks: number; superWins: number; ms: number; avgMs: number; maxMs: number; processed: number; wasm: boolean; spatialSimd: boolean; webGpu: boolean; gpuSampleMs: number; webGpuStatus: WebGpuStatus; webGpuReason: string; workerPool: number; turboPairs: number; captureTargetFps: number; timingFps: number; timingSkips: number; laneFrames: [number, number]; proc: number; tracked: number; phase: 'search' | 'bootstrap' | 'payload'; colorConfidence: number; spatialBlur: number; gpuCapture: boolean }) => void
+    onStats?: (s: { looks: number; combinedWins: number; superLooks: number; superWins: number; ms: number; avgMs: number; maxMs: number; processed: number; wasm: boolean; spatialSimd: boolean; webGpu: boolean; gpuSampleMs: number; webGpuStatus: WebGpuStatus; webGpuReason: string; workerPool: number; turboPairs: number; captureTargetFps: number; timingFps: number; timingSkips: number; laneFrames: number[]; proc: number; tracked: number; phase: 'search' | 'bootstrap' | 'payload'; colorConfidence: number; spatialBlur: number; gpuCapture: boolean }) => void
     onDetect?: (spec: EncodingSpec) => void  // fires once auto-detect locks on
     /** Fires when the fixed metadata strip identifies a single or Turbo ×2 layout. */
-    onLayoutDetect?: (lanes: 1 | 2) => void
-    /** 1 = normal full-frame scan, 2 = two side-by-side Turbo lanes. */
-    tileCount?: 1 | 2
-    /** Let the sender barcode choose 1/2 lanes; false preserves the user's choice. */
+    onLayoutDetect?: (lanes: OpticalLaneCount) => void
+    onControl?: (control: TransferControl) => void
+    /** Multi-lane layouts use two columns and up to three rows. */
+    tileCount?: OpticalLaneCount
+    /** Let the sender barcode choose the lane count; false preserves the user's choice. */
     autoLayout?: boolean
 }
 
 type Status = 'starting' | 'permission' | 'scanning' | 'error'
 
-export default function CameraReader({ spec, auto, active, manifest, onScan, onResolution, onStats, onDetect, onLayoutDetect, tileCount = 1, autoLayout = true }: Props) {
+export default function CameraReader({ spec, auto, active, manifest, onScan, onResolution, onStats, onDetect, onLayoutDetect, onControl, tileCount = 1, autoLayout = true }: Props) {
     const videoRef = useRef<HTMLVideoElement>(null)
     const canvasRef = useRef<HTMLCanvasElement>(null)
     // Live tracking overlay: the worker reports the detected matrix corners each
@@ -46,14 +49,16 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
     onDetectRef.current = onDetect
     const onLayoutRef = useRef(onLayoutDetect)
     onLayoutRef.current = onLayoutDetect
+    const onControlRef = useRef(onControl)
+    onControlRef.current = onControl
     // The sender advertises its layout in the fixed barcode. Keep it in a ref so
     // switching from one lane to Turbo ×2 does not tear down the camera/worker pool.
-    const layoutRef = useRef<1 | 2>(tileCount)
+    const layoutRef = useRef<OpticalLaneCount>(tileCount)
     layoutRef.current = tileCount
     // Physical layout learned from the sender is distinct from how many lanes
     // the user chose to consume. Forced-single on a Turbo sender should crop L1
     // at full detail, not scan the whole two-tile screen at half cell resolution.
-    const sourceLayoutRef = useRef<1 | 2>(tileCount)
+    const sourceLayoutRef = useRef<OpticalLaneCount>(tileCount)
     const autoLayoutRef = useRef(autoLayout)
     autoLayoutRef.current = autoLayout
     const manifestRef = useRef(manifest)
@@ -240,7 +245,7 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
         // lane once it has one, otherwise its SoftReceiver would alternate two
         // unrelated codewords and could never temporal-combine repeated looks.
         const workerLane: number[] = []
-        const turboPairs: [number, number][] = []
+        const turboPairs: number[][] = []
         let nextTurboPair = 0
         // Once the manifest is known, the sender tells us how frequently the
         // displayed matrix actually changes. A 30-fps camera looking at a 6.5-fps
@@ -267,7 +272,7 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
         let webGpuEver = false
         let webGpuStatus: WebGpuStatus = 'waiting'
         let webGpuReason = 'waiting for manifest'
-        const laneFrames: [number, number] = [0, 0]
+        const laneFrames = Array<number>(6).fill(0)
         // Worker tracking state is private, so replies can legitimately arrive as
         // payload/bootstrap/payload while the pool warms up. Surface one session-
         // level lock that becomes stable after any worker proves payload tracking.
@@ -275,10 +280,11 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
         let sessionPayloadLocked = false
         const recentDataSeeds = new Set<number>()
         const recentSeedQueue: number[] = []
-        const lastSuccessfulTimingTick: [number | null, number | null] = [null, null]
-        const lastObservedTimingTick: [number | null, number | null] = [null, null]
-        const laneTrackHints: [TrackHint | null, TrackHint | null] = [null, null]
-        const laneTrackHintAt: [number, number] = [0, 0]
+        const lastSuccessfulTimingTick = Array<number | null>(6).fill(null)
+        const lastObservedTimingTick = Array<number | null>(6).fill(null)
+        const laneTrackHints = Array<TrackHint | null>(6).fill(null)
+        const laneTrackHintAt = Array<number>(6).fill(0)
+        const controlAssembler = new TransferControlAssembler()
         let detectedSenderFps = 0
         let timingSkips = 0
         let duplicatePressure = 0
@@ -302,15 +308,20 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
             }
             if (webGpuEver) webGpuStatus = 'active'
             const repliedLane = workerLane[wi]
-            if (repliedLane === 0 || repliedLane === 1) laneFrames[repliedLane]++
+            if (repliedLane >= 0 && repliedLane < laneFrames.length) laneFrames[repliedLane]++
+            if (e.data.controlPage) {
+                const control = controlAssembler.add(e.data.controlPage)
+                if (control) onControlRef.current?.(control)
+            }
             // A barcode-only duplicate reply is intentionally tiny; including it
             // in LDPC capacity estimation would make the scheduler believe the
             // device can decode far more real frames than it actually can.
             if (!e.data.duplicateFrame)
                 decodeEwma = decodeEwma === 0 ? e.data.ms : decodeEwma * 0.82 + e.data.ms * 0.18
             const { result, found, lockedSpec } = e.data
+            const decodedResults = e.data.results?.length ? e.data.results : (result ? [result] : [])
             if (!e.data.duplicateFrame && manifestRef.current) {
-                const success = result ? 1 : 0
+                const success = decodedResults.length ? 1 : 0
                 payloadSuccessEwma = payloadQualitySamples === 0
                     ? success
                     : payloadSuccessEwma * 0.88 + success * 0.12
@@ -322,10 +333,11 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                 sessionPayloadLocked = false
                 recentDataSeeds.clear()
                 recentSeedQueue.length = 0
-                lastSuccessfulTimingTick[0] = lastSuccessfulTimingTick[1] = null
-                lastObservedTimingTick[0] = lastObservedTimingTick[1] = null
-                laneTrackHints[0] = laneTrackHints[1] = null
-                laneTrackHintAt[0] = laneTrackHintAt[1] = 0
+                lastSuccessfulTimingTick.fill(null)
+                lastObservedTimingTick.fill(null)
+                laneTrackHints.fill(null)
+                laneTrackHintAt.fill(0)
+                controlAssembler.reset()
                 sharedTimingTicks?.fill(-1)
                 duplicatePressure = 0
                 ultraCleanMode = false
@@ -335,12 +347,14 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
             if (e.data.senderFps && e.data.senderFps >= 1 && e.data.senderFps <= 120)
                 detectedSenderFps = e.data.senderFps
             const timingLane = e.data.timingLane
-            const trackLane = timingLane === 0 || timingLane === 1 ? timingLane : repliedLane
-            if ((trackLane === 0 || trackLane === 1) && e.data.trackHint) {
+            const timingLaneValid = timingLane != null && timingLane >= 0 && timingLane < laneFrames.length
+            const trackLane = timingLaneValid ? timingLane : repliedLane
+            if (trackLane >= 0 && trackLane < laneFrames.length && e.data.trackHint) {
                 laneTrackHints[trackLane] = e.data.trackHint
                 laneTrackHintAt[trackLane] = performance.now()
             }
-            if (timingLane === 0 || timingLane === 1) {
+            if (timingLaneValid && timingLane != null) {
+                const opticalComplete = e.data.opticalComplete ?? decodedResults.length > 0
                 const repeatedTick = lastObservedTimingTick[timingLane] === e.data.timingTick
                 lastObservedTimingTick[timingLane] = e.data.timingTick ?? lastObservedTimingTick[timingLane]
                 // The dynamic strip provides a direct duplicate signal even when
@@ -356,20 +370,22 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                         nextUsefulCaptureAt = Math.max(nextUsefulCaptureAt, performance.now() + phaseDelay)
                     }
                 }
-                if (result && e.data.timingTick != null)
+                if (opticalComplete && e.data.timingTick != null)
                     lastSuccessfulTimingTick[timingLane] = e.data.timingTick
-                if (result && e.data.timingTick != null && sharedTimingTicks)
+                if (opticalComplete && e.data.timingTick != null && sharedTimingTicks)
                     Atomics.store(sharedTimingTicks, timingLane, e.data.timingTick)
             }
             if (activeTransferId != null && e.data.phase === 'payload') sessionPayloadLocked = true
             const stablePhase = sessionPayloadLocked ? 'payload' : (e.data.phase ?? 'search')
-            if (result?.type === FRAME_TYPE_DATA) {
-                const duplicate = recentDataSeeds.has(result.seed)
-                duplicatePressure = duplicatePressure * 0.92 + (duplicate ? 0.08 : 0)
-                if (!duplicate) {
-                    recentDataSeeds.add(result.seed)
-                    recentSeedQueue.push(result.seed)
-                    if (recentSeedQueue.length > 256) recentDataSeeds.delete(recentSeedQueue.shift()!)
+            for (const decoded of decodedResults) {
+                if (decoded.type === FRAME_TYPE_DATA) {
+                    const duplicate = recentDataSeeds.has(decoded.seed)
+                    duplicatePressure = duplicatePressure * 0.92 + (duplicate ? 0.08 : 0)
+                    if (!duplicate) {
+                        recentDataSeeds.add(decoded.seed)
+                        recentSeedQueue.push(decoded.seed)
+                        if (recentSeedQueue.length > 256) recentDataSeeds.delete(recentSeedQueue.shift()!)
+                    }
                 }
             }
             if (e.data.lanes) {
@@ -508,8 +524,11 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
             // A barcode-confirmed duplicate never entered LDPC, so it is neither
             // a valid nor a failed optical decode attempt. Keep benchmark rates
             // honest and expose it separately through timingSkips.
-            if (!e.data.duplicateFrame)
-                onScanRef.current(found ? result : null, e.data.lockedSpec)
+            if (!e.data.duplicateFrame) {
+                if (found && decodedResults.length)
+                    for (const decoded of decodedResults) onScanRef.current(decoded, e.data.lockedSpec)
+                else onScanRef.current(null, e.data.lockedSpec)
+            }
         }
         for (let i = 0; i < POOL; i++) {
             const wk = new Worker(new URL('../services/decodeWorker.ts', import.meta.url), { type: 'module' })
@@ -638,11 +657,18 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                     // merely moved the same bug to every dense profile.  Dense modes
                     // now obtain their pixels by increasing `proc`, above, while the
                     // optical coordinate system remains identical for the whole run.
-                    const cropTurboTile = laneCount === 2 || sourceLaneCount === 2
-                    const cropW = cropTurboTile ? Math.max(1, Math.round(vw * 0.56)) : vw
-                    const cropH = cropTurboTile ? Math.min(vh, cropW) : vh
-                    const sx = cropTurboTile ? (lane === 0 ? 0 : vw - cropW) : 0
-                    const sy = cropTurboTile ? Math.max(0, Math.round((vh - cropH) / 2)) : 0
+                    const cropTurboTile = laneCount > 1 || sourceLaneCount > 1
+                    const physicalLanes = Math.max(laneCount, sourceLaneCount)
+                    const rows = Math.max(1, Math.ceil(physicalLanes / 2))
+                    const column = lane & 1
+                    const row = Math.floor(lane / 2)
+                    const cropW = cropTurboTile ? Math.max(1, Math.round(vw * 0.54)) : vw
+                    const rowBand = vh / rows
+                    const cropH = cropTurboTile ? Math.min(cropW, Math.max(1, Math.round(rowBand * 1.08))) : vh
+                    const centerX = (column + 0.5) * vw / 2
+                    const centerY = (row + 0.5) * rowBand
+                    const sx = cropTurboTile ? Math.max(0, Math.min(vw - cropW, Math.round(centerX - cropW / 2))) : 0
+                    const sy = cropTurboTile ? Math.max(0, Math.min(vh - cropH, Math.round(centerY - cropH / 2))) : 0
                     const ar = cropW / cropH
                     const proc = isAuto ? procRef.current : fixedProc
                     const procW = ar >= 1 ? proc : Math.round(proc * ar)
@@ -654,7 +680,7 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                     const resizeQuality = knownEnc === 'color16' || knownEnc === 'color32' || knownEnc === 'color64'
                         ? 'medium' as const : 'low' as const
                     busy[wi] = true
-                    if (laneCount === 2) workerLane[wi] = lane
+                    if (laneCount > 1) workerLane[wi] = lane
                     const rid = reqId++
                     const trackHint = performance.now() - laneTrackHintAt[lane] <= 750
                         ? laneTrackHints[lane] ?? undefined
@@ -694,35 +720,30 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                                 const hasManifest = !!manifestRef.current
                                 const binaryMode = manifestRef.current?.enc === 'bw'
                                 const dispatches: { worker: number; lane: number }[] = []
-                                // A Turbo exposure is one atomic pair. Wait until
-                                // both lane-owned workers are idle, then crop L1 and
-                                // L2 from the exact same camera frame. Letting the
-                                // faster lane run alone made its counter race ahead
-                                // and reassigned workers across unrelated SoftReceiver
-                                // histories. Once assigned, ownership never crosses.
-                                if (laneCount === 2 && workers.length >= 2) {
-                                    // Bootstrap keeps a single stateful pair so its
-                                    // SoftReceivers can combine repeated manifest
-                                    // looks. Payload may use every complete pair:
-                                    // on a four-worker device pair B overlaps pair A
-                                    // without ever decoding the same camera exposure.
-                                    const desiredPairs = hasManifest ? Math.floor(workers.length / 2) : 1
+                                // A multi-lane exposure is atomic. Assign a sticky
+                                // worker to each consumable tile and wait until the
+                                // complete group is idle before cropping one camera
+                                // exposure. Devices with fewer workers than optical
+                                // lanes consume a deterministic subset; Fountain
+                                // repairs preserve correctness at reduced speed.
+                                if (laneCount > 1 && workers.length >= 2) {
+                                    const consumedLanes = Math.min(laneCount, workers.length)
+                                    const desiredPairs = hasManifest ? Math.max(1, Math.floor(workers.length / consumedLanes)) : 1
                                     while (turboPairs.length < desiredPairs) {
                                         const free = workerLane
                                             .map((lane, wi) => ({ lane, wi }))
                                             .filter(item => item.lane < 0 && !busy[item.wi])
                                             .map(item => item.wi)
-                                        if (free.length < 2) break
-                                        const pair: [number, number] = [free[0], free[1]]
-                                        workerLane[pair[0]] = 0
-                                        workerLane[pair[1]] = 1
-                                        turboPairs.push(pair)
+                                        if (free.length < consumedLanes) break
+                                        const group = free.slice(0, consumedLanes)
+                                        for (let lane = 0; lane < group.length; lane++) workerLane[group[lane]] = lane
+                                        turboPairs.push(group)
                                     }
                                     for (let offset = 0; offset < turboPairs.length; offset++) {
                                         const pairIndex = (nextTurboPair + offset) % turboPairs.length
-                                        const pair = turboPairs[pairIndex]
-                                        if (!busy[pair[0]] && !busy[pair[1]]) {
-                                            dispatches.push({ worker: pair[0], lane: 0 }, { worker: pair[1], lane: 1 })
+                                        const group = turboPairs[pairIndex]
+                                        if (group.every(worker => !busy[worker])) {
+                                            for (let lane = 0; lane < group.length; lane++) dispatches.push({ worker: group[lane], lane })
                                             nextTurboPair = (pairIndex + 1) % turboPairs.length
                                             break
                                         }
@@ -789,7 +810,7 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                                 // signal. Back off smoothly (down to 78%) until new
                                 // seeds dominate again, reducing LDPC/thermal load
                                 // without guessing the sender display's true rate.
-                                const temporalFactor = laneCount === 2
+                                const temporalFactor = laneCount > 1
                                     ? Math.max(0.78, 1.02 - duplicatePressure * 0.90)
                                     : decodeEwma > 0 && decodeEwma < 165 ? 1.20
                                         : decodeEwma > 0 && decodeEwma < 240 ? 1.12 : 1.05
@@ -800,18 +821,18 @@ export default function CameraReader({ spec, auto, active, manifest, onScan, onR
                                 // busy. Using dispatches.length here made the idle
                                 // diagnostic briefly divide by one and report an
                                 // impossible captureTargetFps above senderFps.
-                                const jobs = laneCount === 2 ? 2 : 1
+                                const jobs = laneCount > 1 ? Math.min(laneCount, workers.length) : 1
                                 const opticalTargetFps = advertisedFps
-                                    ? Math.min(binaryMode ? 26 : laneCount === 2 ? 22 : 14, Math.max(3, advertisedFps * laneCount / jobs * temporalFactor))
-                                    : (laneCount === 2 ? (jobs >= 2 ? 9 : 18) : 24)
+                                    ? Math.min(binaryMode ? 26 : laneCount > 1 ? 22 : 14, Math.max(3, advertisedFps * temporalFactor))
+                                    : (laneCount > 1 ? 9 : 24)
                                 // Fast advertises a 12-tick ceiling, but the receiver
                                 // chooses how much of it to consume. Derive a safe
                                 // exposure rate from the measured decode EWMA and the
                                 // workers that form complete Turbo pairs. Four-worker
                                 // devices settle near 9fps; six-worker devices can
                                 // rise to the full 12fps without a feedback channel.
-                                const activeDecodeWorkers = laneCount === 2
-                                    ? Math.max(2, turboPairs.length * 2)
+                                const activeDecodeWorkers = laneCount > 1
+                                    ? Math.max(jobs, turboPairs.length * jobs)
                                     : workers.length
                                 const processingCapacityFps = hasManifest && decodeEwma > 0
                                     ? activeDecodeWorkers * 1000 / decodeEwma / jobs * 0.90

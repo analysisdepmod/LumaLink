@@ -31,6 +31,7 @@ export const METADATA_BARCODE_ROWS = 2
 /** Row 2 carries a changing timing word (fps/tick/lane). */
 export const TIMING_BARCODE_ROW = 2
 export const BARCODE_VERSION = 2
+export type OpticalLaneCount = 1 | 2 | 4 | 6
 
 const ENC_ORDER: Encoding[] = ['color64', 'color32', 'color16', 'color8', 'bw']
 // Keep existing indices stable for previously generated v3 matrices. The final
@@ -59,7 +60,7 @@ export interface BarcodeData {
   gridW: number
   gridH: number
   /** Static display layout; bit-packed into unused grid-width metadata space. */
-  lanes?: 1 | 2
+  lanes?: OpticalLaneCount
 }
 
 export interface TimingBarcodeData {
@@ -68,7 +69,7 @@ export interface TimingBarcodeData {
   /** Logical sender tick, modulo 1024 on the wire. */
   tick: number
   /** Optical tile within one atomic Turbo exposure. */
-  lane: 0 | 1
+  lane: number
 }
 
 export function rateToIdx(rate: number): number {
@@ -121,7 +122,13 @@ function buildPattern(data: BarcodeData): number[] {
   // before it has decoded any manifest frame.
   const widthRaw = Math.min(32, Math.round(data.gridW / 8))
   const width = widthRaw === 32 ? 0 : widthRaw
-  const aux = data.zones ? data.ringWidth : width | (data.lanes === 2 ? 0x20 : 0)
+  const laneCode = data.lanes === 6 ? 3 : data.lanes === 4 ? 2 : data.lanes === 2 ? 1 : 0
+  // v3 spends two aux bits on a 1/2/4/6-lane layout. The receiver already
+  // enumerates candidate widths, so four low width bits are enough to reject
+  // aliases for the practical 64/72 profiles (zero remains the wide-grid escape).
+  const aux = data.zones ? data.ringWidth
+    : (data.version ?? BARCODE_VERSION) >= 3 ? (laneCode << 4) | (widthRaw & 0x0f)
+      : width | (data.lanes === 2 ? 0x20 : 0)
   const dataBits = [
     ...intToBits(data.version ?? BARCODE_VERSION, 2),
     ...intToBits(encToIdx(data.enc), 3),
@@ -158,15 +165,12 @@ export function encodeBarcodeRow(data: BarcodeData, gridW: number): Uint8Array {
 // all three top rows still see the two full-contrast metadata rows as a clean
 // majority, while the wider timing separation survives camera blur/exposure well
 // enough to reject duplicate ticks before the expensive full-grid LDPC pass.
-const TIMING_VERSION = 1
-export function encodeTimingBarcodeRow(data: TimingBarcodeData, gridW: number): Uint8Array {
+const TIMING_VERSION = 2
+export function encodeTimingBarcodeRow(data: TimingBarcodeData, gridW: number, metadataVersion = BARCODE_VERSION): Uint8Array {
   const fpsHalf = Math.max(0, Math.min(255, Math.round(data.fps * 2)))
-  const dataBits = [
-    ...intToBits(TIMING_VERSION, 2),
-    ...intToBits(fpsHalf, 8),
-    ...intToBits(data.tick & 0x3FF, 10),
-    data.lane & 1,
-  ]
+  const dataBits = metadataVersion >= 3
+    ? [...intToBits(TIMING_VERSION, 2), ...intToBits(fpsHalf, 8), ...intToBits(data.tick & 0xff, 8), ...intToBits(data.lane & 7, 3)]
+    : [...intToBits(1, 2), ...intToBits(fpsHalf, 8), ...intToBits(data.tick & 0x3ff, 10), data.lane & 1]
   const pattern = [...SYNC, ...dataBits, ...intToBits(crc7(dataBits, DATA_BITS), CRC_BITS)]
   const out = new Uint8Array(gridW * 3)
   for (let i = 0; i < gridW; i++) {
@@ -180,18 +184,20 @@ export function encodeTimingBarcodeRow(data: TimingBarcodeData, gridW: number): 
 
 function decodeFromBits(bits: number[], off: number): BarcodeData {
   const d = bits.slice(off + SYNC.length, off + SYNC.length + DATA_BITS)
+  const version = bitsToInt(d, 0, 2)
   const zones = !!d[8]
   const aux = bitsToInt(d, 15, 6)
-  const lanes = zones ? 1 : (aux & 0x20 ? 2 : 1)
+  const laneCode = version >= 3 ? aux >>> 4 : (aux & 0x20 ? 1 : 0)
+  const lanes: OpticalLaneCount = zones ? 1 : laneCode === 3 ? 6 : laneCode === 2 ? 4 : laneCode === 1 ? 2 : 1
   return {
-    version: bitsToInt(d, 0, 2),
+    version,
     enc: idxToEnc(bitsToInt(d, 2, 3)),
     rate: idxToRate(bitsToInt(d, 5, 3)),
     zones,
     ringWidth: zones ? aux : 0,
-    gridW: zones ? 0 : ((aux & 0x1F) || 32) * 8,
+    gridW: zones ? 0 : version >= 3 ? ((aux & 0x0f) * 8) : ((aux & 0x1F) || 32) * 8,
     gridH: bitsToInt(d, 9, 6) * 8,
-    ...(lanes === 2 ? { lanes: 2 as const } : {}),
+    ...(lanes > 1 ? { lanes } : {}),
   }
 }
 
@@ -281,12 +287,11 @@ export function decodeTimingBarcodeRow(lum: Float32Array, cellCount: number): Ti
       if (!syncOk) continue
       const dataBits = bits.slice(off + SYNC.length, off + SYNC.length + DATA_BITS)
       const crc = bitsToInt(bits, off + SYNC.length + DATA_BITS, CRC_BITS)
-      if (crc7(dataBits, DATA_BITS) !== crc || bitsToInt(dataBits, 0, 2) !== TIMING_VERSION) continue
-      return {
-        fps: bitsToInt(dataBits, 2, 8) / 2,
-        tick: bitsToInt(dataBits, 10, 10),
-        lane: bitsToInt(dataBits, 20, 1) as 0 | 1,
-      }
+      const version = bitsToInt(dataBits, 0, 2)
+      if (crc7(dataBits, DATA_BITS) !== crc || (version !== 1 && version !== TIMING_VERSION)) continue
+      return version >= 2
+        ? { fps: bitsToInt(dataBits, 2, 8) / 2, tick: bitsToInt(dataBits, 10, 8), lane: bitsToInt(dataBits, 18, 3) }
+        : { fps: bitsToInt(dataBits, 2, 8) / 2, tick: bitsToInt(dataBits, 10, 10), lane: bitsToInt(dataBits, 20, 1) }
     }
   }
   return null

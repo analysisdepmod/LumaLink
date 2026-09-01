@@ -179,6 +179,64 @@ export function capacityBits(s: EncodingSpec): number {
 }
 export function capacityBytes(s: EncodingSpec): number { return Math.floor(capacityBits(s) / 8) }
 
+/**
+ * v11 Color8 divides the payload area into four independently protected
+ * quadrants.  A local glare/blur patch can then erase at most one codeword
+ * instead of invalidating the whole matrix.  Capacities are derived entirely
+ * from geometry, so no extra optical metadata is required.
+ */
+export function segmentedColor8Capacities(s: EncodingSpec): readonly number[] {
+  if (s.enc !== 'color8') return []
+  const dataRows = Math.max(0, s.gridH - BARCODE_ROWS)
+  const left = Math.ceil(s.gridW / 2), right = Math.floor(s.gridW / 2)
+  const top = Math.ceil(dataRows / 2), bottom = Math.floor(dataRows / 2)
+  return [left * top, right * top, left * bottom, right * bottom]
+    .map(cells => Math.floor(cells * 3 / 8))
+}
+
+function color8SegmentForCell(x: number, y: number, s: EncodingSpec): number {
+  const dataY = y - BARCODE_ROWS
+  const topRows = Math.ceil((s.gridH - BARCODE_ROWS) / 2)
+  return (dataY < topRows ? 0 : 2) + (x < Math.ceil(s.gridW / 2) ? 0 : 1)
+}
+
+/** Encode four concatenated, independently-whitened codewords into quadrants. */
+export function encodeCellsRGBSegmented(payload: Uint8Array, s: EncodingSpec): Uint8Array {
+  if (s.enc !== 'color8') return encodeCellsRGB(payload, s)
+  const caps = segmentedColor8Capacities(s)
+  const offsets = [0, caps[0], caps[0] + caps[1], caps[0] + caps[1] + caps[2]]
+  const bits = caps.map((cap, i) => bytesToBits(payload.subarray(offsets[i], offsets[i] + cap)))
+  const cursors = [0, 0, 0, 0]
+  const out = new Uint8Array(gridCells(s) * 3)
+  for (let y = BARCODE_ROWS; y < s.gridH; y++) for (let x = 0; x < s.gridW; x++) {
+    const segment = color8SegmentForCell(x, y, s)
+    const cursor = cursors[segment]
+    const cell = (y * s.gridW + x) * 3
+    out[cell] = bits[segment][cursor] ? 255 : 0
+    out[cell + 1] = bits[segment][cursor + 1] ? 255 : 0
+    out[cell + 2] = bits[segment][cursor + 2] ? 255 : 0
+    cursors[segment] += 3
+  }
+  return out
+}
+
+/** Split the ordinary row-major Color8 LLR stream back into four quadrants. */
+export function splitColor8SegmentLlrs(llr: Float32Array, s: EncodingSpec): Float32Array[] {
+  const caps = segmentedColor8Capacities(s)
+  if (caps.length !== 4) return [Float32Array.from(llr)]
+  const out = caps.map(cap => new Float32Array(cap * 8))
+  const cursors = [0, 0, 0, 0]
+  for (let y = BARCODE_ROWS; y < s.gridH; y++) for (let x = 0; x < s.gridW; x++) {
+    const segment = color8SegmentForCell(x, y, s)
+    const src = ((y - BARCODE_ROWS) * s.gridW + x) * 3
+    const dst = cursors[segment]
+    for (let channel = 0; channel < 3 && dst + channel < out[segment].length; channel++)
+      out[segment][dst + channel] = llr[src + channel]
+    cursors[segment] += 3
+  }
+  return out
+}
+
 // ── encode: payload bytes → per-cell RGB (0..255 ×3) for the display ──
 // Row 0 is left black (reserved for the barcode strip — caller overlays it).
 export function encodeCellsRGB(payload: Uint8Array, s: EncodingSpec): Uint8Array {

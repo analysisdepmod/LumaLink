@@ -3,18 +3,19 @@
 // lane1 claim A, lane1 claim B]. Two claim slots let the two Turbo worker pairs
 // pipeline DIFFERENT display ticks without ever LDPC-decoding the SAME tick twice.
 
-export const TIMING_LANES = 2
+export const TIMING_LANES = 6
 export const TIMING_CLAIMS_PER_LANE = 2
 export const TIMING_STATE_WORDS = TIMING_LANES + TIMING_LANES * TIMING_CLAIMS_PER_LANE
 export const TIMING_DUPLICATE = -2
 export const TIMING_UNCLAIMED = -1
 
-function claimStart(lane: 0 | 1): number {
+function claimStart(lane: number): number {
   return TIMING_LANES + lane * TIMING_CLAIMS_PER_LANE
 }
 
 /** Returns a claim-slot index, TIMING_DUPLICATE, or TIMING_UNCLAIMED when full. */
-export function claimTimingTick(state: Int32Array, lane: 0 | 1, tick: number): number {
+export function claimTimingTick(state: Int32Array, lane: number, tick: number): number {
+  if (!Number.isInteger(lane) || lane < 0 || lane >= TIMING_LANES) return TIMING_UNCLAIMED
   if (Atomics.load(state, lane) === tick) return TIMING_DUPLICATE
   const start = claimStart(lane)
   for (let i = 0; i < TIMING_CLAIMS_PER_LANE; i++)
@@ -40,11 +41,12 @@ export function claimTimingTick(state: Int32Array, lane: 0 | 1, tick: number): n
 
 export function finishTimingClaim(
   state: Int32Array,
-  lane: 0 | 1,
+  lane: number,
   tick: number,
   slot: number,
   succeeded: boolean,
 ): void {
+  if (!Number.isInteger(lane) || lane < 0 || lane >= TIMING_LANES) return
   if (succeeded) Atomics.store(state, lane, tick)
   if (slot >= TIMING_LANES) Atomics.compareExchange(state, slot, tick, TIMING_UNCLAIMED)
 }

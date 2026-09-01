@@ -4,8 +4,9 @@ import { readFileSync } from 'node:fs'
 import { decodeBarcodeRow, decodeTimingBarcodeRow, encodeBarcodeRow, encodeTimingBarcodeRow } from '../src/services/metaBarcode.ts'
 import { FountainDecoder } from '../src/services/fountainDecoder.ts'
 import { indicesForSeed } from '../src/services/fountainDecoder.ts'
-import { buildTransfer, decodeManifestWire, encodeManifestFrames, encodeManifestWire, finishTransfer, fountainEncode, FRAME_TYPE_DATA, maxPayload, packFrameLdpc, parseFrameLdpcSoft, seedForBalancedDataIndex, seedForDataIndex, type TransferManifest } from '../src/services/transferCodec.ts'
-import { capacityBytes, encodeCellsRGB, equalizeSpatialReadings, softDemodLLR, type EncodingSpec } from '../src/services/visualCodec.ts'
+import { buildTransfer, decodeManifestWire, encodeManifestFrames, encodeManifestWire, finishTransfer, fountainEncode, FRAME_TYPE_DATA, maxPayload, packFrameLdpc, parseFrameLdpcSoft, seedForBalancedDataIndex, seedForDataIndex, seedForInnovativeDataIndex, type TransferManifest } from '../src/services/transferCodec.ts'
+import { CONTROL_PAGE_COUNT, TransferControlAssembler, decodeControlBarcodeRow, encodeControlBarcodeRow } from '../src/services/controlBarcode.ts'
+import { capacityBytes, encodeCellsRGB, encodeCellsRGBSegmented, equalizeSpatialReadings, segmentedColor8Capacities, softDemodLLR, splitColor8SegmentLlrs, type EncodingSpec } from '../src/services/visualCodec.ts'
 import { encodeHierarchicalCells, hierarchicalLayout, hierarchicalSeeds, softDemodHierarchical } from '../src/services/hierarchicalCodec.ts'
 import { estimateSubpixelShift, fuseLooks } from '../src/services/superReceiver.ts'
 import { homographyCoefficients } from '../src/services/webGpuGridSampler.ts'
@@ -14,6 +15,22 @@ import { instantiateLdpcWasm } from '../src/services/ldpcWasmCore.ts'
 import { assessOpticalLink } from '../src/services/opticalCalibration.ts'
 import { sampleMapped } from '../src/services/matrixVision.ts'
 import { claimTimingTick, finishTimingClaim, TIMING_DUPLICATE, TIMING_STATE_WORDS, TIMING_UNCLAIMED } from '../src/services/timingClaims.ts'
+
+function hardLlrs(bytes: Uint8Array): Float32Array {
+  const llr = new Float32Array(bytes.length * 8)
+  for (let byte = 0; byte < bytes.length; byte++) for (let bit = 0; bit < 8; bit++)
+    llr[byte * 8 + bit] = bytes[byte] & (1 << (7 - bit)) ? -12 : 12
+  return llr
+}
+
+function parseSegmented(frame: Uint8Array, caps: readonly number[], rate: number) {
+  let offset = 0
+  return caps.map(cap => {
+    const parsed = parseFrameLdpcSoft(hardLlrs(frame.subarray(offset, offset + cap)), cap, rate)
+    offset += cap
+    return parsed
+  })
+}
 
 test('calibration rates measured Turbo useful capacity instead of an impossible raw ceiling', () => {
   const result = assessOpticalLink({
@@ -71,6 +88,22 @@ test('metadata barcode preserves the exact non-zoned grid', () => {
   assert.deepEqual(decoded, { version: 1, enc: 'color8', rate: 0.65, zones: false, ringWidth: 0, gridW: 64, gridH: 64 })
 })
 
+test('v11 fast control row reconstructs Fountain essentials from shuffled optical lanes', () => {
+  const expected = { id: 0xf1234567, k: 987_654, chunk: 65_000, comp: 987_654_321 }
+  const assembler = new TransferControlAssembler()
+  let decoded = null
+  const order = [6, 1, 9, 0, 4, 8, 3, 7, 2, 5]
+  assert.equal(order.length, CONTROL_PAGE_COUNT)
+  for (const page of order) {
+    const row = encodeControlBarcodeRow(expected, page, 72)
+    const lum = Float32Array.from({ length: 72 }, (_, cell) => row[cell * 3])
+    const parsed = decodeControlBarcodeRow(lum, 72)
+    assert.ok(parsed)
+    decoded = assembler.add(parsed!) ?? decoded
+  }
+  assert.deepEqual(decoded, expected)
+})
+
 test('Fast 72x72 raises payload capacity while preserving exact barcode geometry', () => {
   const spec: EncodingSpec = { enc: 'color8', gridW: 72, gridH: 72, rate: 0.625 }
   assert.equal(maxPayload(spec), 1151)
@@ -83,7 +116,7 @@ test('Fast 72x72 raises payload capacity while preserving exact barcode geometry
   assert.equal(decoded?.lanes, 2)
 })
 
-test('Fast 72x72 completes a clean end-to-end v10 transfer', async () => {
+test('Fast 72x72 completes a clean end-to-end v11 transfer', async () => {
   const spec: EncodingSpec = { enc: 'color8', gridW: 72, gridH: 72, rate: 0.625 }
   const raw = new Uint8Array(18_000)
   let state = 0x12345678
@@ -94,20 +127,69 @@ test('Fast 72x72 completes a clean end-to-end v10 transfer', async () => {
   const built = await buildTransfer(raw, { kind: 'file', name: 'fast72.bin', mime: 'application/octet-stream' }, {
     spec, chunkSize: maxPayload(spec), frameCount: 1, fps: 12, lanes: 2, systematicRun: 8,
   })
-  assert.equal(built.manifest.v, 10)
-  assert.equal(built.manifest.chunk, 1151)
+  assert.equal(built.manifest.v, 11)
+  assert.equal(built.segmented, true)
+  assert.equal(built.manifest.chunk, 273)
   const decoder = new FountainDecoder(built.manifest.k, built.manifest.chunk, true, 2)
-  const capacity = capacityBytes(spec)
+  const caps = segmentedColor8Capacities(spec)
   for (let index = 0; index < built.frameCount && !decoder.isComplete; index++) {
     const frame = built.frameAt(index)
-    const llr = new Float32Array(capacity * 8)
-    for (let byte = 0; byte < frame.length; byte++) for (let bit = 0; bit < 8; bit++)
-      llr[byte * 8 + bit] = frame[byte] & (1 << (7 - bit)) ? -12 : 12
-    const parsed = parseFrameLdpcSoft(llr, capacity, spec.rate)
-    if (parsed?.type === FRAME_TYPE_DATA) decoder.addFrame(parsed.seed, parsed.payload)
+    const rgb = encodeCellsRGBSegmented(frame, spec)
+    const cells = spec.gridW * spec.gridH
+    const readings = {
+      r: Float32Array.from({ length: cells }, (_, cell) => rgb[cell * 3]),
+      g: Float32Array.from({ length: cells }, (_, cell) => rgb[cell * 3 + 1]),
+      b: Float32Array.from({ length: cells }, (_, cell) => rgb[cell * 3 + 2]),
+      lum: Float32Array.from({ length: cells }, (_, cell) => (rgb[cell * 3] + rgb[cell * 3 + 1] + rgb[cell * 3 + 2]) / 3),
+      rel: Float32Array.from({ length: cells }, () => 1),
+    }
+    const llrs = splitColor8SegmentLlrs(softDemodLLR(readings, spec), spec)
+    const parsedSegments = llrs.map((llr, segment) => parseFrameLdpcSoft(llr, caps[segment], spec.rate))
+    for (const parsed of parsedSegments)
+      if (parsed?.type === FRAME_TYPE_DATA) decoder.addFrame(parsed.seed, parsed.payload)
   }
   assert.equal(decoder.isComplete, true)
   assert.deepEqual(await finishTransfer(decoder.reconstruct(), built.manifest), raw)
+})
+
+test('v11 first-K fountain rows remain independent and reconstruct after ordered delivery', () => {
+  const k = 257, chunk = 37
+  const source = Array.from({ length: k }, (_, index) => Uint8Array.from({ length: chunk }, (_, byte) => (index * 31 + byte * 17) & 0xff))
+  const decoder = new FountainDecoder(k, chunk, true, 2)
+  for (let index = 0; index < k; index++) {
+    const seed = seedForInnovativeDataIndex(index, k)
+    decoder.addFrame(seed, fountainEncode(source, seed, chunk, 2))
+  }
+  assert.equal(decoder.innovativeRank, k)
+  assert.equal(decoder.dependentEquations, 0)
+  assert.equal(decoder.isComplete, true)
+})
+
+test('v11 closes after deterministic lane and quadrant losses without a repair-only stall', () => {
+  const k = 257, chunk = 37
+  const source = Array.from({ length: k }, (_, index) => Uint8Array.from({ length: chunk }, (_, byte) => (index * 19 + byte * 43) & 0xff))
+  const decoder = new FountainDecoder(k, chunk, true, 2)
+  for (let index = 0; index < k * 2 && !decoder.isComplete; index++) {
+    // Model a weaker display lane plus a moving glare quadrant (~27% erased).
+    if (index % 5 === 1 || index % 13 === 7) continue
+    const seed = seedForInnovativeDataIndex(index, k)
+    decoder.addFrame(seed, fountainEncode(source, seed, chunk, 2))
+  }
+  assert.equal(decoder.isComplete, true)
+  assert.deepEqual(decoder.reconstruct(), Uint8Array.from(source.flatMap(part => [...part])))
+})
+
+test('v3 metadata and timing rows address all six two-column lanes', () => {
+  for (const lanes of [4, 6] as const) {
+    const row = encodeBarcodeRow({ version: 3, enc: 'color8', rate: 0.625, zones: false, ringWidth: 0, gridW: 72, gridH: 72, lanes }, 72)
+    const decoded = decodeBarcodeRow(Float32Array.from({ length: 72 }, (_, cell) => row[cell * 3]), 72)
+    assert.equal(decoded?.lanes, lanes)
+  }
+  const timing = encodeTimingBarcodeRow({ fps: 12, tick: 233, lane: 5 }, 72, 3)
+  assert.deepEqual(
+    decodeTimingBarcodeRow(Float32Array.from({ length: 72 }, (_, cell) => timing[cell * 3]), 72),
+    { fps: 12, tick: 233, lane: 5 },
+  )
 })
 
 test('Turbo medium transfers publish a redundant manifest checkpoint at most every 64 payload frames', async () => {
@@ -121,16 +203,13 @@ test('Turbo medium transfers publish a redundant manifest checkpoint at most eve
   const built = await buildTransfer(raw, { kind: 'file', name: 'checkpoint.bin', mime: 'application/octet-stream' }, {
     spec, chunkSize: maxPayload(spec), frameCount: 1, fps: 12, lanes: 2,
   })
-  const capacity = capacityBytes(spec)
+  const caps = segmentedColor8Capacities(spec)
   const types: number[] = []
   for (let index = 0; index < built.frameCount; index++) {
     const frame = built.frameAt(index)
-    const llr = new Float32Array(capacity * 8)
-    for (let byte = 0; byte < frame.length; byte++) for (let bit = 0; bit < 8; bit++)
-      llr[byte * 8 + bit] = frame[byte] & (1 << (7 - bit)) ? -12 : 12
-    const parsed = parseFrameLdpcSoft(llr, capacity, spec.rate)
-    assert.ok(parsed)
-    types.push(parsed!.type)
+    const parsed = parseSegmented(frame, caps, spec.rate!)
+    assert.ok(parsed.every(Boolean))
+    types.push(parsed[0]!.type)
   }
   const firstData = types.indexOf(FRAME_TYPE_DATA)
   assert.ok(firstData >= 0)

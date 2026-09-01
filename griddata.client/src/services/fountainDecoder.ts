@@ -81,6 +81,19 @@ function sampleDistinct(rng: Mulberry32, k: number, d: number): number[] {
 }
 
 export function indicesForSeed(seed: number, k: number, tailRepair = true, mediumWideEvery = 4): number[] {
+  // v11 innovation seed: bit 31 marks a sparse lower-triangular row. Its unique
+  // highest pivot makes every subset of the first K scheduled rows linearly
+  // independent, while 1-3 earlier neighbours preserve cheap peeling.
+  if ((seed >>> 31) === 1) {
+    const pivot = ((seed & 0x7fff_ffff) - 1) >>> 0
+    if (pivot >= k) return []
+    if (pivot === 0) return [0]
+    const rng = new Mulberry32((seed ^ k ^ 0x11a7c0de) >>> 0)
+    const degree = 1 + Math.min(3, pivot)
+    const prior = sampleDistinct(rng, pivot, degree - 1)
+    prior.push(pivot)
+    return prior
+  }
   // Systematic fountain: seeds 1..k map to the RAW source chunk (seed-1). So the
   // first k data frames the sender emits are the plain chunks — on a clean channel
   // the receiver reconstructs in ~k frames with ZERO fountain overhead (every frame

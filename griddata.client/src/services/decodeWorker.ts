@@ -10,7 +10,7 @@
 // full LDPC decodes per candidate.
 
 import { locateMatrix, locateMatrixHeld, locateMatrixTracked, sampleMapped, sampleMappedBinary, sampleBarcodeLum, sampleRowLum, type GridMap, type Corners, type TrackState, type Located } from './matrixVision'
-import { equalizeSpatialReadings, estimateSpatialBlur, setSpatialSimd, softDemodLLR, softDemodLLRZoned, capacityBytes, capacityBytesZoned, type CellReadings, type Encoding, type EncodingSpec, type ZoneMap } from './visualCodec'
+import { equalizeSpatialReadings, estimateSpatialBlur, setSpatialSimd, softDemodLLR, softDemodLLRZoned, capacityBytes, capacityBytesZoned, segmentedColor8Capacities, splitColor8SegmentLlrs, type CellReadings, type Encoding, type EncodingSpec, type ZoneMap } from './visualCodec'
 import { SoftReceiver } from './softReceiver'
 import { SuperReceiver } from './superReceiver'
 import { parseFrameLdpcSoft, specFromManifest, zoneMapFromManifest, type ParsedFrame, type TransferManifest } from './transferCodec'
@@ -18,7 +18,8 @@ import { buildZoneMap, isMultiZone } from './adaptiveZones'
 import { setBpDecoder } from './ldpc'
 import { loadLdpcWasm } from './ldpcWasm'
 import { loadSpatialSimd } from './spatialSimdWasm'
-import { BARCODE_VERSION, BARCODE_ROWS, METADATA_BARCODE_ROWS, TIMING_BARCODE_ROW, decodeBarcodeRow, decodeTimingBarcodeRow } from './metaBarcode'
+import { BARCODE_VERSION, BARCODE_ROWS, METADATA_BARCODE_ROWS, TIMING_BARCODE_ROW, decodeBarcodeRow, decodeTimingBarcodeRow, type OpticalLaneCount } from './metaBarcode'
+import { CONTROL_BARCODE_ROW, decodeControlBarcodeRow, type TransferControlPage } from './controlBarcode'
 import { WebGpuGridSampler } from './webGpuGridSampler'
 import { claimTimingTick, finishTimingClaim, TIMING_DUPLICATE, TIMING_UNCLAIMED } from './timingClaims'
 
@@ -55,7 +56,7 @@ interface DecodeRequest {
   reset?: boolean
   /** Last timing tick that this lane already decoded successfully. */
   lastTimingTick?: number
-  expectedLane?: 0 | 1
+  expectedLane?: number
   /** Atomic successful-tick table shared by every decoder worker when isolated. */
   timingState?: SharedArrayBuffer
   /** Recent successful finder fit from the other worker assigned to this lane. */
@@ -67,16 +68,22 @@ export type WebGpuStatus = 'waiting' | 'probing' | 'active' | 'unavailable' | 'r
 export interface DecodeReply {
   id: number
   result: ParsedFrame | null
+  /** v11 Color8 can recover up to four independent codewords per matrix. */
+  results?: ParsedFrame[]
+  /** Every independent codeword in this optical matrix decoded successfully. */
+  opticalComplete?: boolean
   found: boolean
   looks: number
   combinedWins: number
   lockedSpec?: EncodingSpec
   /** Number of fixed visual lanes advertised by the metadata strip. */
-  lanes?: 1 | 2
+  lanes?: OpticalLaneCount
+  /** One CRC-protected page of the v11 fast transfer descriptor. */
+  controlPage?: TransferControlPage
   /** Sender timing read before full-grid demodulation. */
   senderFps?: number
   timingTick?: number
-  timingLane?: 0 | 1
+  timingLane?: number
   /** Full LDPC was intentionally skipped because this tick already succeeded. */
   duplicateFrame?: boolean
   ms: number
@@ -156,6 +163,7 @@ function deriveGridH(map: GridMap, gridW: number): number {
 }
 
 let rx: SoftReceiver | null = null
+let segmentRx: SoftReceiver[] | null = null
 // SR is deliberately a BW-only rescue path. It is invoked only after the normal
 // equalizer + soft-combiner has failed, and only for dense grids where sub-pixel
 // diversity can recover information the single-look path cannot.
@@ -165,6 +173,7 @@ let superFusedLooks = 0
 let superWins = 0
 let locked: EncodingSpec | null = null
 let lockedZm: ZoneMap | null = null
+let lockedMetadataVersion = BARCODE_VERSION
 // `locked` begins with the robust bootstrap rate from the barcode. Once the
 // manifest arrives we atomically replace it with the actual payload spec/rate.
 let lockedTransferId: number | null = null
@@ -260,7 +269,8 @@ let curWebGpu = false
 let curGpuSampleMs: number | undefined
 let curSenderFps: number | undefined
 let curTimingTick: number | undefined
-let curTimingLane: 0 | 1 | undefined
+let curTimingLane: number | undefined
+let curControlPage: TransferControlPage | undefined
 let curDuplicateFrame = false
 let curTimingClaimSlot = TIMING_UNCLAIMED
 let curTimingSharedState: Int32Array | null = null
@@ -339,11 +349,12 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
   curSenderFps = undefined
   curTimingTick = undefined
   curTimingLane = undefined
+  curControlPage = undefined
   curDuplicateFrame = false
   curTimingClaimSlot = TIMING_UNCLAIMED
   curTimingSharedState = timingState ? new Int32Array(timingState) : null
   try {
-    if (reset) { locked = null; lockedZm = null; lockedTransferId = null; rx = null; superRx = null; superKey = ''; superFusedLooks = 0; superWins = 0; resetSpatialCalibration(); resetGpuValidation(); fCursor = 0; pendingKey = ''; pendingCount = 0; sinceProgress = 0; barcodeSeen = false; trackState = null; trackVelocity = null; heldMapFrames = 0; trackingReady = false; trackingGood = 0; trackedFailures = 0 }
+    if (reset) { locked = null; lockedZm = null; lockedMetadataVersion = BARCODE_VERSION; lockedTransferId = null; rx = null; segmentRx = null; superRx = null; superKey = ''; superFusedLooks = 0; superWins = 0; resetSpatialCalibration(); resetGpuValidation(); fCursor = 0; pendingKey = ''; pendingCount = 0; sinceProgress = 0; barcodeSeen = false; trackState = null; trackVelocity = null; heldMapFrames = 0; trackingReady = false; trackingGood = 0; trackedFailures = 0 }
     // Once any worker has decoded the manifest, CameraReader forwards it to the
     // whole pool. Lock every worker directly from that authoritative spec: data
     // frames deliberately carry no barcode, so they remain untouched LDPC payload.
@@ -353,9 +364,11 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
       const changed = !locked || locked.enc !== nextLocked.enc || locked.gridW !== nextLocked.gridW || locked.gridH !== nextLocked.gridH || locked.rate !== nextLocked.rate || !!lockedZm !== !!nextZm
       locked = nextLocked
       lockedZm = nextZm
+      lockedMetadataVersion = manifest.v >= 11 ? 3 : BARCODE_VERSION
       lockedTransferId = manifest.id
       if (changed) {
         rx = null
+        segmentRx = null
         superRx = null; superKey = ''; superFusedLooks = 0
         resetSpatialCalibration()
         resetGpuValidation()
@@ -468,6 +481,14 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
 
     const known = auto ? locked : (spec ?? null)
     if (known) {
+      if (lockedMetadataVersion >= 3) {
+        try {
+          curControlPage = decodeControlBarcodeRow(
+            sampleRowLum(px, w, h, map, known.gridW, known.gridH, CONTROL_BARCODE_ROW),
+            known.gridW,
+          ) ?? undefined
+        } catch { /* the full optical decode remains available */ }
+      }
       // The dedicated row is only 64 luminance samples. Read it before the full
       // colour grid and LDPC work. A tick is skipped only when CameraReader says
       // this lane already decoded it successfully, preserving repeat looks after
@@ -492,11 +513,12 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
         }
       } catch { /* timing is opportunistic; normal decode remains authoritative */ }
       const cap = lockedZm ? capacityBytesZoned(lockedZm) : capacityBytes(known)
+      const segmented = lockedMetadataVersion >= 3 && known.enc === 'color8' && !lockedZm
       // Before the manifest, dense BW must attempt BP on the first capture. The
       // former defer=true setting could stay forever at look 1 under slight phone
       // motion and therefore never execute LDPC. After K is known, defer the costly
       // payload BP again because independent fountain frames favour throughput.
-      if (!rx) {
+      if (!rx && !segmented) {
         const denseBw = known.enc === 'bw' && known.gridW * known.gridH >= 10000
         // CameraReader distributes native 128² payload frames over several
         // workers. A worker therefore usually sees a NEW fountain frame on its
@@ -584,16 +606,42 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
       const readings = equalizeSpatialReadings(rawReadings, known, { strength: curSpatialBlur })
       curColorConfidence = meanReliability(readings.rel)
       const llr = lockedZm ? softDemodLLRZoned(readings, lockedZm) : softDemodLLR(readings, known)
+      if (segmented) {
+        const caps = [...segmentedColor8Capacities(known)]
+        if (!segmentRx || segmentRx.length !== caps.length)
+          segmentRx = caps.map(capacity => new SoftReceiver(capacity, known.rate ?? 0.6, 12, false))
+        const results: ParsedFrame[] = []
+        const segmentLlrs = splitColor8SegmentLlrs(llr, known)
+        for (let segment = 0; segment < segmentRx.length; segment++) {
+          const parsed = segmentRx[segment].feed(segmentLlrs[segment])
+          if (parsed) results.push(parsed)
+        }
+        const result = results[0] ?? null
+        noteTrack(located, usedTracked, results.length > 0)
+        if (auto) {
+          if (results.length) sinceProgress = 0
+          else if (lockedTransferId == null) sinceProgress++
+        }
+        reply({
+          id, result, results, found: true,
+          opticalComplete: results.length === segmentRx.length,
+          looks: Math.max(...segmentRx.map(receiver => receiver.looks)),
+          combinedWins: segmentRx.reduce((sum, receiver) => sum + receiver.combinedWins, 0),
+        })
+        return
+      }
       // Buffer only looks that the exact same SoftReceiver identity test regards
       // as one displayed frame. SR never participates on an already successful
       // ordinary decode, so it is strictly an additive rescue path.
       const sr = lockedZm ? null : superFor(known)
-      const same = sr ? rx.sameFrame(llr) : false
+      // Non-segmented paths always initialise rx above.
+      const receiver = rx!
+      const same = sr ? receiver.sameFrame(llr) : false
       if (sr) {
         if (!same) { sr.reset(); superFusedLooks = 0 }
         sr.feed(rawReadings.lum)
       }
-      let result = rx.feed(llr)
+      let result = receiver.feed(llr)
       if (!result && sr && sr.count >= 3 && sr.count !== superFusedLooks) {
         superFusedLooks = sr.count
         try {
@@ -620,7 +668,7 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
       if (auto) {
         if (result) sinceProgress = 0
         else if (lockedTransferId == null && ++sinceProgress >= RELOCK_AFTER) {
-          locked = null; lockedZm = null; lockedTransferId = null; rx = null; superRx = null; superKey = ''; superFusedLooks = 0; resetSpatialCalibration(); sinceProgress = 0
+          locked = null; lockedZm = null; lockedTransferId = null; rx = null; segmentRx = null; superRx = null; superKey = ''; superFusedLooks = 0; resetSpatialCalibration(); sinceProgress = 0
           // Also drop the CV-tracking state (reset does this too): a relock means the
           // current lock is stale, so any tracked homography built under it is stale
           // and must not be carried into re-acquisition.
@@ -630,7 +678,7 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
           return
         }
       }
-      reply({ id, result, found: true, looks: rx.looks, combinedWins: rx.combinedWins })
+      reply({ id, result, found: true, looks: receiver.looks, combinedWins: receiver.combinedWins })
       return
     }
 
@@ -639,7 +687,7 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
     // metadata barcode. Deriving gridH from geometry means any rectangular grid
     // the sender chose is found without guessing its height. The first width
     // whose barcode CRC passes wins.
-    let hit: { spec: EncodingSpec; zm: ZoneMap | null; lanes: 1 | 2 } | null = null
+    let hit: { spec: EncodingSpec; zm: ZoneMap | null; lanes: OpticalLaneCount; version: number } | null = null
     for (const gw of GRID_WIDTHS) {
       const ghApprox = deriveGridH(map, gw)
       if (gw * ghApprox > MAX_DETECT_CELLS) continue
@@ -647,9 +695,12 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
         // Read the barcode STRIP (all BARCODE_ROWS rows averaged) at the geometry-
         // derived height — good enough to place row 0, since it's at the very top.
         const rowLum = sampleBarcodeLum(px, w, h, map, gw, ghApprox, METADATA_BARCODE_ROWS)
-        const bc = decodeBarcodeRow(rowLum, gw)
+        let bc = decodeBarcodeRow(rowLum, gw)
+        // v11 uses row 1 for fast control, so its metadata lock lives in row 0
+        // alone. Try that contract after the legacy two-row majority probe.
+        if (!bc) bc = decodeBarcodeRow(sampleBarcodeLum(px, w, h, map, gw, ghApprox, 1), gw)
         if (!bc) continue
-        if (bc.version !== BARCODE_VERSION) continue
+        if (bc.version !== BARCODE_VERSION && bc.version !== 3) continue
         // A valid CRC alone is not enough: without an explicit width a barcode
         // sampled at the wrong grid density can alias into a false lock.
         if (bc.gridW !== 0 && bc.gridW !== gw) continue
@@ -671,12 +722,19 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
           }
         } catch { /* metadata lock remains valid without the timing row */ }
         const zm = (bc.zones && bc.enc !== 'bw') ? buildZoneMap(gw, gh, bc.enc, bc.ringWidth) : null
-        hit = { spec: s, zm, lanes: bc.lanes ?? 1 }
+        if (bc.version >= 3) {
+          try {
+            curControlPage = decodeControlBarcodeRow(
+              sampleRowLum(px, w, h, map, gw, gh, CONTROL_BARCODE_ROW), gw,
+            ) ?? undefined
+          } catch { /* acquire remains valid */ }
+        }
+        hit = { spec: s, zm, lanes: bc.lanes ?? 1, version: bc.version }
         break
       } catch { /* sample error — skip this width */ }
     }
     if (hit) {
-      const { spec: s, zm, lanes } = hit
+      const { spec: s, zm, lanes, version } = hit
       const key = `${s.enc}:${s.gridW}:${s.gridH}:${zm ? 'z' : ''}`
       try {
         const cap = zm ? capacityBytesZoned(zm) : capacityBytes(s)
@@ -689,7 +747,7 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
         const parsed = parseFrameLdpcSoft(llr, cap, s.rate, true)
         if (parsed) {
           // Full frame decoded → spec is certainly correct: lock immediately.
-          locked = s; lockedZm = zm; rx = new SoftReceiver(cap, s.rate, s.enc === 'bw' ? 12 : 24, false)
+          locked = s; lockedZm = zm; lockedMetadataVersion = version; rx = new SoftReceiver(cap, s.rate, s.enc === 'bw' ? 12 : 24, false)
           pendingKey = ''; pendingCount = 0
           reply({ id, result: parsed, found: true, looks: 1, combinedWins: 0, lockedSpec: s, lanes })
           return
@@ -699,7 +757,7 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
         if (key === pendingKey) {
           pendingCount++
           if (pendingCount >= 2) {
-            locked = s; lockedZm = zm; rx = new SoftReceiver(cap, s.rate, s.enc === 'bw' ? 12 : 24, false)
+            locked = s; lockedZm = zm; lockedMetadataVersion = version; rx = new SoftReceiver(cap, s.rate, s.enc === 'bw' ? 12 : 24, false)
             reply({ id, result: null, found: true, looks: 1, combinedWins: 0, lockedSpec: s, lanes })
             return
           }
@@ -753,9 +811,9 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
   }
 }
 
-function reply(r: Omit<DecodeReply, 'ms' | 'wasm' | 'spatialSimd' | 'webGpu' | 'gpuSampleMs' | 'webGpuStatus' | 'webGpuReason' | 'dark' | 'quad' | 'tracked' | 'phase' | 'colorConfidence' | 'superLooks' | 'superWins' | 'spatialBlur' | 'senderFps' | 'timingTick' | 'timingLane' | 'duplicateFrame' | 'trackHint'>) {
+function reply(r: Omit<DecodeReply, 'ms' | 'wasm' | 'spatialSimd' | 'webGpu' | 'gpuSampleMs' | 'webGpuStatus' | 'webGpuReason' | 'dark' | 'quad' | 'tracked' | 'phase' | 'colorConfidence' | 'superLooks' | 'superWins' | 'spatialBlur' | 'senderFps' | 'timingTick' | 'timingLane' | 'duplicateFrame' | 'trackHint' | 'controlPage'>) {
   if (curTimingSharedState && curTimingLane != null && curTimingTick != null) {
-    finishTimingClaim(curTimingSharedState, curTimingLane, curTimingTick, curTimingClaimSlot, !!r.result)
+    finishTimingClaim(curTimingSharedState, curTimingLane, curTimingTick, curTimingClaimSlot, r.opticalComplete ?? !!r.result)
     curTimingClaimSlot = TIMING_UNCLAIMED
   }
   const sharedTrack = r.result && trackState
@@ -769,7 +827,7 @@ function reply(r: Omit<DecodeReply, 'ms' | 'wasm' | 'spatialSimd' | 'webGpu' | '
   // old worker only sent it on the one lock transition; a manifest decoded by a
   // later worker reply could therefore reach ReceivePage without the geometry
   // required by the compact v6+ wire format.
-  ;(self as unknown as Worker).postMessage({ ...r, lockedSpec: r.lockedSpec ?? locked ?? undefined, ms: performance.now() - t0, wasm: wasmActive, spatialSimd: spatialSimdActive, webGpu: curWebGpu, gpuSampleMs: curGpuSampleMs, webGpuStatus: gpuStatus, webGpuReason: gpuReason, dark: curDark, quad: curQuad, tracked: curTracked, phase: curPhase, colorConfidence: curColorConfidence, superLooks: superRx?.count ?? 0, superWins, spatialBlur: curSpatialBlur, senderFps: curSenderFps, timingTick: curTimingTick, timingLane: curTimingLane, duplicateFrame: curDuplicateFrame, trackHint: sharedTrack })
+  ;(self as unknown as Worker).postMessage({ ...r, lockedSpec: r.lockedSpec ?? locked ?? undefined, controlPage: curControlPage, ms: performance.now() - t0, wasm: wasmActive, spatialSimd: spatialSimdActive, webGpu: curWebGpu, gpuSampleMs: curGpuSampleMs, webGpuStatus: gpuStatus, webGpuReason: gpuReason, dark: curDark, quad: curQuad, tracked: curTracked, phase: curPhase, colorConfidence: curColorConfidence, superLooks: superRx?.count ?? 0, superWins, spatialBlur: curSpatialBlur, senderFps: curSenderFps, timingTick: curTimingTick, timingLane: curTimingLane, duplicateFrame: curDuplicateFrame, trackHint: sharedTrack })
 }
 
 function meanReliability(rel?: Float32Array): number | undefined {

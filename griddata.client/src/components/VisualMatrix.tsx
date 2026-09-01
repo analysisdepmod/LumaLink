@@ -4,8 +4,9 @@ import {
   PauseOutlined, PlayCircleOutlined,
   FullscreenOutlined, FullscreenExitOutlined,
 } from '@ant-design/icons'
-import { encodeCellsRGB, encodeCellsRGBZoned, type EncodingSpec, type ZoneMap } from '../services/visualCodec'
+import { encodeCellsRGB, encodeCellsRGBSegmented, encodeCellsRGBZoned, type EncodingSpec, type ZoneMap } from '../services/visualCodec'
 import { encodeBarcodeRow, encodeTimingBarcodeRow, METADATA_BARCODE_ROWS, TIMING_BARCODE_ROW, type BarcodeData } from '../services/metaBarcode'
+import { CONTROL_BARCODE_ROW, CONTROL_PAGE_COUNT, encodeControlBarcodeRow, type TransferControl } from '../services/controlBarcode'
 import { FRAME_RATIO, QUIET_RATIO, FINDER_SIZE_FRAC } from '../services/matrixVision'
 
 interface Props {
@@ -15,6 +16,9 @@ interface Props {
   fps: number
   zoneMap?: ZoneMap
   barcode?: BarcodeData
+  control?: TransferControl
+  /** v11 Color8: the optical payload contains four independent LDPC quadrants. */
+  segmented?: boolean
   /** A tile is rendered without its own controls; the parent owns the stage. */
   compact?: boolean
   /** Interleave this tile through one shared fountain stream. */
@@ -25,7 +29,7 @@ interface Props {
   /** Shared sender clock. Turbo supplies this so both optical lanes paint atomically. */
   frameIndex?: number
   /** Physical optical lane encoded into the timing strip. */
-  lane?: 0 | 1
+  lane?: number
 }
 
 export interface VisualMatrixHandle {
@@ -213,7 +217,7 @@ function initGL(canvas: HTMLCanvasElement): GlState | null {
   }
 }
 
-const VisualMatrix = forwardRef<VisualMatrixHandle, Props>(function VisualMatrix({ frameAt, frameCount, spec, fps, zoneMap, barcode, compact = false, frameOffset = 0, frameStride = 1, holdTicks = 1, frameIndex, lane = 0 }, ref) {
+const VisualMatrix = forwardRef<VisualMatrixHandle, Props>(function VisualMatrix({ frameAt, frameCount, spec, fps, zoneMap, barcode, control, segmented = false, compact = false, frameOffset = 0, frameStride = 1, holdTicks = 1, frameIndex, lane = 0 }, ref) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
   const glRef = useRef<GlState | null>(null)
@@ -281,7 +285,9 @@ const VisualMatrix = forwardRef<VisualMatrixHandle, Props>(function VisualMatrix
     const logicalIndex = Math.floor(idx / Math.max(1, holdTicks))
     const frameNo = (logicalIndex * frameStride + frameOffset) % frameCount
     const opticalFrame = frameAt(frameNo)
-    const rgb = zoneMap ? encodeCellsRGBZoned(opticalFrame, zoneMap) : encodeCellsRGB(opticalFrame, spec)
+    const rgb = zoneMap ? encodeCellsRGBZoned(opticalFrame, zoneMap)
+      : segmented ? encodeCellsRGBSegmented(opticalFrame, spec)
+      : encodeCellsRGB(opticalFrame, spec)
     const bootstrap = isBootstrapFrame(frameNo, frameCount <= 1)
     const dataScale = bootstrap ? bootstrapScale : 1
     const drawDataW = Math.round(dataW * dataScale)
@@ -305,14 +311,20 @@ const VisualMatrix = forwardRef<VisualMatrixHandle, Props>(function VisualMatrix
       [finderCtrX, canvasH - finderCtrY],       // bottom-left
       [canvasW - finderCtrX, canvasH - finderCtrY], // bottom-right
     ]
-    // Rows 0-1 retain the full-contrast metadata lock. Row 2 carries a changing,
-    // CRC-protected timing word so the receiver knows the sender clock before
-    // spending CPU on the full colour grid. Its lower contrast preserves a clean
-    // metadata majority for older receivers that average all three rows.
+    // v11 keeps row 0 as the optical lock, uses row 1 as a paged fast-control
+    // channel, and retains the changing timing word in row 2. Legacy v10 keeps
+    // the former duplicated metadata rows.
     if (barcode) {
       const br = encodeBarcodeRow(barcode, gridW)
-      for (let r = 0; r < METADATA_BARCODE_ROWS; r++) rgb.set(br, r * gridW * 3)
-      const timing = encodeTimingBarcodeRow({ fps, tick: logicalIndex, lane }, gridW)
+      if (barcode.version >= 3 && control) {
+        rgb.set(br, 0)
+        const laneCount = Math.max(1, barcode.lanes ?? 1)
+        const page = (logicalIndex * laneCount + lane) % CONTROL_PAGE_COUNT
+        rgb.set(encodeControlBarcodeRow(control, page, gridW), CONTROL_BARCODE_ROW * gridW * 3)
+      } else {
+        for (let r = 0; r < METADATA_BARCODE_ROWS; r++) rgb.set(br, r * gridW * 3)
+      }
+      const timing = encodeTimingBarcodeRow({ fps, tick: logicalIndex, lane }, gridW, barcode.version)
       rgb.set(timing, TIMING_BARCODE_ROW * gridW * 3)
     }
     const n = gridW * gridH
@@ -382,7 +394,7 @@ const VisualMatrix = forwardRef<VisualMatrixHandle, Props>(function VisualMatrix
     cctx.putImageData(img, 0, 0)
     ctx.imageSmoothingEnabled = false
     ctx.drawImage(cellCanvas, 0, 0, gridW, gridH, offX, offY, drawDataW, drawDataH)
-  }, [frameAt, frameCount, spec, gridW, gridH, dataW, dataH, canvasW, canvasH, bootstrapScale, cellCanvas, texBuf, zoneMap, barcode, holdTicks, fps, lane])
+  }, [frameAt, frameCount, spec, gridW, gridH, dataW, dataH, canvasW, canvasH, bootstrapScale, cellCanvas, texBuf, zoneMap, barcode, control, segmented, holdTicks, fps, lane])
 
   const isStatic = frameCount <= 1
 

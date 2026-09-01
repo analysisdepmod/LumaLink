@@ -23,9 +23,10 @@
 import { crc32 } from './crc32'
 import { compress, decompress, packPayload, sha256Hex, unpackPayload, unpackPayloadAsync, type PackedPayload } from './compress'
 import { indicesForSeed } from './fountainDecoder'
-import { capacityBytes, capacityBytesZoned, bytesToBits, bitsToBytes, specRate, DEFAULT_RATE, type Encoding, type EncodingSpec, type ZoneMap } from './visualCodec'
+import { capacityBytes, capacityBytesZoned, bytesToBits, bitsToBytes, segmentedColor8Capacities, specRate, DEFAULT_RATE, type Encoding, type EncodingSpec, type ZoneMap } from './visualCodec'
 import { deserializeZoneMap, serializeZoneMap } from './adaptiveZones'
 import { makeLdpcKM, ldpcEncodeParity, ldpcDecodeMapped, type LdpcCode, type SoftBits } from './ldpc'
+import type { OpticalLaneCount } from './metaBarcode'
 
 const MANIFEST_SUBHEADER = 2 // [partIndex, partCount] prefix on manifest payloads
 
@@ -36,7 +37,7 @@ export const FRAME_TYPE_DATA = 1
 export const FRAME_TYPE_SOLO = 2 // whole transfer in one static frame
 
 export interface TransferManifest {
-  v: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10
+  v: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11
   id: number            // random id — receiver detects a new transfer by this
   kind: 'file' | 'text'
   name: string          // filename ('' for text)
@@ -63,7 +64,7 @@ export function isValidManifest(value: unknown): value is TransferManifest {
   const finite = (n: unknown, min: number, max: number): n is number => typeof n === 'number' && Number.isInteger(n) && n >= min && n <= max
   const gridW = m.gridW
   const gridH = m.gridH
-  return (m.v === 1 || m.v === 2 || m.v === 3 || m.v === 4 || m.v === 5 || m.v === 6 || m.v === 7 || m.v === 8 || m.v === 9 || m.v === 10)
+  return (m.v === 1 || m.v === 2 || m.v === 3 || m.v === 4 || m.v === 5 || m.v === 6 || m.v === 7 || m.v === 8 || m.v === 9 || m.v === 10 || m.v === 11)
     && finite(m.id, 0, 0xFFFF_FFFF)
     && (m.kind === 'file' || m.kind === 'text')
     && typeof m.name === 'string' && m.name.length <= 512
@@ -86,7 +87,7 @@ export interface BuildOptions {
   zoneMap?: ZoneMap          // adaptive spatial coding zone map
   zoneRingWidth?: number     // ring width used to build the zone map (for manifest)
   fps?: number               // actual display rate selected by the sender
-  lanes?: 1 | 2              // optical tiles advanced on every display tick
+  lanes?: OpticalLaneCount   // optical tiles advanced on every display tick
   /** Direct source frames emitted between repair equations (Fast can use a longer run). */
   systematicRun?: number
 }
@@ -103,6 +104,8 @@ export interface BuiltTransfer {
   capacity: number          // bytes per frame (full grid capacity)
   dataFrameCount: number
   static: boolean           // true = one self-contained frame, no animation
+  /** The matrix carries four independently protected Color8 quadrants. */
+  segmented: boolean
 }
 
 export interface SoloContent {
@@ -401,6 +404,16 @@ export function seedForBalancedDataIndex(dataIndex: number, k: number): number {
   return k + repairOrdinal
 }
 
+/** v11 starts with K sparse triangular rows. Every row owns a unique pivot, so
+ * no received subset can contain a dependent equation. The rateless repair tail
+ * then uses the established mixed Robust-Soliton mapping. */
+export function seedForInnovativeDataIndex(dataIndex: number, k: number): number {
+  dataIndex = Math.max(0, Math.floor(dataIndex))
+  k = Math.max(1, Math.floor(k))
+  if (dataIndex < k) return (0x8000_0000 | (dataIndex + 1)) >>> 0
+  return k + (dataIndex - k) + 1
+}
+
 const textEncoder = new TextEncoder()
 const textDecoder = new TextDecoder()
 
@@ -485,7 +498,7 @@ export function decodeManifestWire(body: Uint8Array, optical?: EncodingSpec): Tr
       const view = new DataView(body.buffer, body.byteOffset, body.byteLength)
       let off = 3
       const v = body[off++]
-      if (v !== 6 && v !== 7 && v !== 8 && v !== 9 && v !== 10) return null
+      if (v !== 6 && v !== 7 && v !== 8 && v !== 9 && v !== 10 && v !== 11) return null
       const id = view.getUint32(off, true); off += 4
       const flags = body[off++]!
       const fps10 = view.getUint16(off, true); off += 2
@@ -656,7 +669,6 @@ export async function buildTransfer(
   const capacity = zm ? capacityBytesZoned(zm) : capacityBytes(opts.spec)
   const rate = specRate(opts.spec)
   const usable = frameDataBytes(opts.spec, zm) - HEADER_BYTES - CRC_BYTES
-  const chunkSize = Math.min(opts.chunkSize, usable)
 
   const [packed, sha256] = await Promise.all([Promise.resolve(packPayload(raw)), sha256Hex(raw)])
 
@@ -664,6 +676,8 @@ export async function buildTransfer(
   const solo = buildSolo(meta, opts.spec, packed, sha256, zm)
   if (solo) {
     const manifest: TransferManifest = {
+      // Static one-frame transfers keep the legacy full-matrix contract; v11's
+      // segmented flag is intentionally reserved for animated Color8 streams.
       v: zm ? 5 : 10, id: randomTransferId(),
       kind: meta.kind, name: meta.name, mime: meta.mime,
       total: raw.length, comp: packed.bytes.length, compressed: packed.compressed, sha256,
@@ -672,13 +686,19 @@ export async function buildTransfer(
       fps: opts.fps,
       ...(zm && opts.zoneRingWidth ? { zones: serializeZoneMap(opts.zoneRingWidth, zm.zones[0].enc) } : {}),
     }
-    return { frameAt: () => solo, frameCount: 1, frames: { length: 1 }, manifest, bootstrapRate: rate, capacity, dataFrameCount: 1, static: true }
+    return { frameAt: () => solo, frameCount: 1, frames: { length: 1 }, manifest, bootstrapRate: rate, capacity, dataFrameCount: 1, static: true, segmented: false }
   }
 
+  const segmented = !zm && opts.spec.enc === 'color8'
+  const segmentCaps = segmented ? [...segmentedColor8Capacities(opts.spec)] : []
+  const segmentUsable = segmented
+    ? Math.min(...segmentCaps.map(cap => ldpcMessageBytes(cap, rate) - HEADER_BYTES - CRC_BYTES))
+    : usable
+  const chunkSize = Math.min(opts.chunkSize, segmentUsable)
   const k = Math.max(1, Math.ceil(packed.bytes.length / chunkSize))
 
   const manifest: TransferManifest = {
-    v: zm ? 5 : 10,
+    v: zm ? 5 : 11,
     id: randomTransferId(),
     kind: meta.kind,
     name: meta.name,
@@ -703,6 +723,9 @@ export async function buildTransfer(
   // correctly but made every following data frame undecodable (0/K forever).
   const bootstrapRate = rate
   const manifestFrames = encodeManifestFrames(manifest, capacity, bootstrapRate)
+  const segmentedManifestFrames = segmented
+    ? segmentCaps.map(cap => encodeManifestFrames(manifest, cap, bootstrapRate))
+    : []
   // The receiver can't decode ANYTHING until it has the manifest (K, chunk size,
   // spec). The leading copies provide an immediate lock-on for the normal flow.
   // Afterwards, re-insert a compact checkpoint. A field run joined after the
@@ -716,7 +739,9 @@ export async function buildTransfer(
   // complete (the receiver needs ~K distinct seeds). A larger pool also means
   // fewer repeat captures → faster collection. So always ensure the recommended
   // count regardless of any smaller requested value.
-  const dataFrameCount = Math.max(opts.frameCount, recommendedFrameCount(k))
+  const equationCount = Math.max(opts.frameCount, recommendedFrameCount(k))
+  // One v11 Color8 matrix transports four independent Fountain equations.
+  const dataFrameCount = segmented ? Math.ceil(equationCount / 4) : equationCount
 
   // Lead with several manifest copies so a late-joining/auto-detecting receiver
   // grabs K and the chunk size within its first captures; then re-insert regularly.
@@ -732,10 +757,19 @@ export async function buildTransfer(
   // per tick, so the old fixed 10-frame lead lasted only ~0.42s at 12fps and
   // payload arrived while the receiver was still assembling the manifest.
   // Give every layout about 1.5 seconds of stable bootstrap before data starts.
-  const bootstrapOpticalFrames = Math.ceil((opts.fps ?? 6.5) * (opts.lanes ?? 1) * 1.5)
-  const leadingManifestCount = manifestFrames.length * Math.max(10,
-    Math.ceil(bootstrapOpticalFrames / manifestFrames.length))
-  const manifestBurst = manifestFrames.length * (opts.lanes === 2 ? 2 : 1)
+  const manifestPageCount = segmented
+    ? Math.max(...segmentedManifestFrames.map(frames => frames.length))
+    : manifestFrames.length
+  // v11's CRC-protected control row supplies id/K/chunk before LDPC. Two paint
+  // ticks are enough to settle tracking while avoiding the old 1.5 s dead-air
+  // preamble. Legacy manifests retain their proven acquisition lead.
+  const bootstrapOpticalFrames = manifest.v >= 11
+    ? Math.max(manifestPageCount, (opts.lanes ?? 1) * 2)
+    : Math.ceil((opts.fps ?? 6.5) * (opts.lanes ?? 1) * 1.5)
+  const leadingManifestCount = manifest.v >= 11
+    ? bootstrapOpticalFrames
+    : manifestFrames.length * Math.max(10, Math.ceil(bootstrapOpticalFrames / manifestFrames.length))
+  const manifestBurst = manifestPageCount * Math.max(1, opts.lanes ?? 1)
   // v9 returns to the field-proven alternating repair mapping. v8's every-wide
   // graph looked ideal under IID simulation but delayed peeling in two real
   // transfers (583/420 and 699/461 equations). The packed, timer-free 128-tail
@@ -751,23 +785,43 @@ export async function buildTransfer(
   // as a random burst of duplicate seeds on an otherwise clean link.
   const cache = new Map<number, Uint8Array>()
   const CACHE_LIMIT = 24
+  const concatenate = (parts: Uint8Array[]): Uint8Array => {
+    const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0))
+    let offset = 0
+    for (const part of parts) { out.set(part, offset); offset += part.length }
+    return out
+  }
+  const segmentedManifestAt = (index: number): Uint8Array => concatenate(
+    segmentedManifestFrames.map((frames, segment) => frames[(index * 4 + segment) % frames.length]!),
+  )
   const renderFrame = (index: number): Uint8Array => {
     let frame: Uint8Array
     if (index < leadingManifestCount) {
-      frame = manifestFrames[index % manifestFrames.length]!
+      frame = segmented ? segmentedManifestAt(index) : manifestFrames[index % manifestFrames.length]!
     } else {
       const pos = index - leadingManifestCount
       const groupSpan = manifestEvery + manifestBurst
       const group = Math.floor(pos / groupSpan)
       const inGroup = pos % groupSpan
       if (group < fullGroups && inGroup >= manifestEvery) {
-        frame = manifestFrames[(inGroup - manifestEvery) % manifestFrames.length]!
+        const manifestIndex = inGroup - manifestEvery
+        frame = segmented ? segmentedManifestAt(manifestIndex) : manifestFrames[manifestIndex % manifestFrames.length]!
       } else {
         const dataIndex = group * manifestEvery + inGroup
-        const seed = manifest.v >= 10
-          ? seedForBalancedDataIndex(dataIndex, k)
-          : seedForDataIndex(dataIndex, k, opts.systematicRun ?? 8)
-        frame = packFrame(FRAME_TYPE_DATA, seed, fountainEncodePayload(packed.bytes, k, seed, chunkSize, mediumWideEvery), capacity, rate)
+        if (segmented) {
+          frame = concatenate(segmentCaps.map((cap, segment) => {
+            const equationIndex = dataIndex * 4 + segment
+            const seed = seedForInnovativeDataIndex(equationIndex, k)
+            return packFrame(FRAME_TYPE_DATA, seed, fountainEncodePayload(packed.bytes, k, seed, chunkSize, mediumWideEvery), cap, rate)
+          }))
+        } else {
+          const seed = manifest.v >= 11
+            ? seedForInnovativeDataIndex(dataIndex, k)
+            : manifest.v >= 10
+              ? seedForBalancedDataIndex(dataIndex, k)
+            : seedForDataIndex(dataIndex, k, opts.systematicRun ?? 8)
+          frame = packFrame(FRAME_TYPE_DATA, seed, fountainEncodePayload(packed.bytes, k, seed, chunkSize, mediumWideEvery), capacity, rate)
+        }
       }
     }
     return frame
@@ -787,7 +841,7 @@ export async function buildTransfer(
     return frame
   }
 
-  return { frameAt, frameCount, frames: { length: frameCount }, manifest, bootstrapRate, capacity, dataFrameCount, static: false }
+  return { frameAt, frameCount, frames: { length: frameCount }, manifest, bootstrapRate, capacity, dataFrameCount, static: false, segmented }
 }
 
 /**

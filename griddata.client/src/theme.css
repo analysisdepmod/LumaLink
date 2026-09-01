@@ -188,10 +188,11 @@ body {
 }
 .gd-turbo-grid {
   --gd-lanes: 2;
+  --gd-rows: 1;
   width: 100%;
   min-width: 0;
   display: grid;
-  grid-template-columns: repeat(var(--gd-lanes), minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 5px;
 }
 .gd-turbo-matrix {
@@ -206,7 +207,7 @@ body {
   justify-content: center;
 }
 .gd-turbo-stage:fullscreen { width: 100vw; min-height: 100vh; padding: 0; }
-.gd-turbo-stage:fullscreen .gd-turbo-grid { width: min(100vw, calc(100vh * var(--gd-lanes))); gap: 3px; }
+.gd-turbo-stage:fullscreen .gd-turbo-grid { width: min(100vw, calc(100vh * 2 / var(--gd-rows))); gap: 3px; }
 .gd-turbo-stage:fullscreen .gd-turbo-controls { position: fixed; bottom: 6px; z-index: 2; opacity: .35; }
 .gd-turbo-stage:fullscreen .gd-turbo-controls:hover { opacity: 1; }
 

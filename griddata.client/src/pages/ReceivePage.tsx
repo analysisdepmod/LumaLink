@@ -13,6 +13,8 @@ import {
   isValidManifest, type TransferManifest, type ParsedFrame,
 } from '../services/transferCodec'
 import { FountainDecoder } from '../services/fountainDecoder'
+import type { OpticalLaneCount } from '../services/metaBarcode'
+import type { TransferControl } from '../services/controlBarcode'
 import { saveDiagnosticReport } from '../services/diagnosticLog'
 import { assessOpticalLink, type OpticalCalibration } from '../services/opticalCalibration'
 import { playChannelTone } from '../services/channelTone'
@@ -78,8 +80,8 @@ interface TransferTimelineSample {
   senderTimingFps: number
   timingSkips: number
   timingSkipsDelta: number
-  laneFrames: [number, number]
-  laneFramesDelta: [number, number]
+  laneFrames: number[]
+  laneFramesDelta: number[]
   quality: number
   colorConfidence: number
   spatialBlur: number
@@ -139,10 +141,10 @@ function summarizeTransferTimeline(samples: TransferTimelineSample[]) {
 
 export default function ReceivePage() {
   const [active, setActive] = useState(false)
-  const [tileCount, setTileCount] = useState<1 | 2>(1)
+  const [tileCount, setTileCount] = useState<OpticalLaneCount>(1)
   const [layoutAuto, setLayoutAuto] = useState(true)
   const [soundEnabled, setSoundEnabled] = useState(false)
-  const tileCountRef = useRef<1 | 2>(1)
+  const tileCountRef = useRef<OpticalLaneCount>(1)
   tileCountRef.current = tileCount
   // Force one render when the optical manifest arrives so CameraReader receives
   // it as a prop and forwards the authoritative spec to every decode worker.
@@ -162,6 +164,7 @@ export default function ReceivePage() {
 
   // Mutable decode state (updated per scan, published to React on an interval).
   const decoderRef = useRef<FountainDecoder | null>(null)
+  const controlRef = useRef<TransferControl | null>(null)
   const manifestRef = useRef<TransferManifest | null>(null)
   const assemblerRef = useRef(new ManifestAssembler())
   const attemptsRef = useRef(0)
@@ -172,17 +175,18 @@ export default function ReceivePage() {
   // mistaken for an impossibly fast optical link.
   const speedEpochRef = useRef(0)
   const doneRef = useRef(false)
-  const statsRef = useRef({ looks: 0, combinedWins: 0, superLooks: 0, superWins: 0, ms: 0, avgMs: 0, maxMs: 0, processed: 0, wasm: false, spatialSimd: false, webGpu: false, gpuSampleMs: 0, webGpuStatus: 'waiting' as 'waiting' | 'probing' | 'active' | 'unavailable' | 'rejected', webGpuReason: 'waiting for manifest', workerPool: 0, turboPairs: 0, captureTargetFps: 0, timingFps: 0, timingSkips: 0, laneFrames: [0, 0] as [number, number], proc: 0, tracked: 0, phase: 'search' as 'search' | 'bootstrap' | 'payload', colorConfidence: 0, spatialBlur: 0, gpuCapture: false })
+  const statsRef = useRef({ looks: 0, combinedWins: 0, superLooks: 0, superWins: 0, ms: 0, avgMs: 0, maxMs: 0, processed: 0, wasm: false, spatialSimd: false, webGpu: false, gpuSampleMs: 0, webGpuStatus: 'waiting' as 'waiting' | 'probing' | 'active' | 'unavailable' | 'rejected', webGpuReason: 'waiting for manifest', workerPool: 0, turboPairs: 0, captureTargetFps: 0, timingFps: 0, timingSkips: 0, laneFrames: Array<number>(6).fill(0), proc: 0, tracked: 0, phase: 'search' as 'search' | 'bootstrap' | 'payload', colorConfidence: 0, spatialBlur: 0, gpuCapture: false })
   const runRef = useRef({ firstValidAt: 0, firstDataAt: 0, validFrames: 0 })
   const pendingDataRef = useRef<ParsedFrame[]>([])
   const diagRef = useRef({ manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-' })
   const timelineRef = useRef<TransferTimelineSample[]>([])
   const timelineStartedAtRef = useRef(0)
-  const [diag, setDiag] = useState({ manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-', ms: 0, wasm: false, webGpu: false, webGpuStatus: 'waiting' as 'waiting' | 'probing' | 'active' | 'unavailable' | 'rejected', webGpuReason: 'waiting for manifest', laneFrames: [0, 0] as [number, number], phase: 'search' as 'search' | 'bootstrap' | 'payload', colorConfidence: 0 })
+  const [diag, setDiag] = useState({ manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-', ms: 0, wasm: false, webGpu: false, webGpuStatus: 'waiting' as 'waiting' | 'probing' | 'active' | 'unavailable' | 'rejected', webGpuReason: 'waiting for manifest', laneFrames: Array<number>(6).fill(0), phase: 'search' as 'search' | 'bootstrap' | 'payload', colorConfidence: 0 })
 
   const reset = useCallback(() => {
     decoderRef.current?.dispose()
     decoderRef.current = null
+    controlRef.current = null
     manifestRef.current = null
     assemblerRef.current = new ManifestAssembler()
     pendingDataRef.current = []
@@ -191,7 +195,7 @@ export default function ReceivePage() {
     startRef.current = 0
     speedEpochRef.current = 0
     doneRef.current = false
-    statsRef.current = { looks: 0, combinedWins: 0, superLooks: 0, superWins: 0, ms: 0, avgMs: 0, maxMs: 0, processed: 0, wasm: false, spatialSimd: false, webGpu: false, gpuSampleMs: 0, webGpuStatus: 'waiting', webGpuReason: 'waiting for manifest', workerPool: 0, turboPairs: 0, captureTargetFps: 0, timingFps: 0, timingSkips: 0, laneFrames: [0, 0], proc: 0, tracked: 0, phase: 'search', colorConfidence: 0, spatialBlur: 0, gpuCapture: false }
+    statsRef.current = { looks: 0, combinedWins: 0, superLooks: 0, superWins: 0, ms: 0, avgMs: 0, maxMs: 0, processed: 0, wasm: false, spatialSimd: false, webGpu: false, gpuSampleMs: 0, webGpuStatus: 'waiting', webGpuReason: 'waiting for manifest', workerPool: 0, turboPairs: 0, captureTargetFps: 0, timingFps: 0, timingSkips: 0, laneFrames: Array<number>(6).fill(0), proc: 0, tracked: 0, phase: 'search', colorConfidence: 0, spatialBlur: 0, gpuCapture: false }
     runRef.current = { firstValidAt: 0, firstDataAt: 0, validFrames: 0 }
     diagRef.current = { manifest: 0, data: 0, dataUnique: 0, dataDuplicate: 0, dataRedundant: 0, solo: 0, soloFail: 0, manifestNull: 0, dataDropped: 0, dataBuffered: 0, manifestInvalid: 0, parts: '-' }
     timelineRef.current = []
@@ -231,10 +235,7 @@ export default function ReceivePage() {
     const manifestFramesDelta = diag.manifest - (previous?.manifestFrames ?? 0)
     const workerFramesDelta = stats.processed - (previous?.workerFramesProcessed ?? 0)
     const timingSkipsDelta = stats.timingSkips - (previous?.timingSkips ?? 0)
-    const laneFramesDelta: [number, number] = [
-      stats.laneFrames[0] - (previous?.laneFrames[0] ?? 0),
-      stats.laneFrames[1] - (previous?.laneFrames[1] ?? 0),
-    ]
+    const laneFramesDelta = stats.laneFrames.map((value, lane) => value - (previous?.laneFrames[lane] ?? 0))
     const signals: string[] = []
     if (previous) {
       if (workerFramesDelta === 0 && attemptsDelta === 0) signals.push('capture-or-scheduler-stall')
@@ -387,7 +388,10 @@ export default function ReceivePage() {
           superResWins: statsRef.current.superWins,
         },
         fountain: decoderRef.current ? {
-          repairProfile: manifest?.v && manifest.v >= 10 ? '1:1-balanced-mixed-packed128' : manifest?.v === 9 ? '8:1-mixed-packed128' : manifest?.v === 8 ? '4:1-wide-packed128' : 'legacy',
+          repairProfile: manifest?.v && manifest.v >= 11 ? 'innovative-triangular-segmented4-packed128'
+            : manifest?.v === 10 ? '1:1-balanced-mixed-packed128'
+              : manifest?.v === 9 ? '8:1-mixed-packed128'
+                : manifest?.v === 8 ? '4:1-wide-packed128' : 'legacy',
           receivedEquations: decoderRef.current.receivedEquations,
           innovativeRank: decoderRef.current.innovativeRank,
           rankExact: decoderRef.current.rankIsExact,
@@ -457,6 +461,29 @@ export default function ReceivePage() {
     return true
   }, [finish])
 
+  const onFastControl = useCallback((control: TransferControl) => {
+    if (control.k < 1 || control.k > 1_000_000
+      || control.chunk < 1 || control.chunk > 1_048_576
+      || control.comp < 0 || control.comp > 1_073_741_824
+      || control.k * control.chunk < control.comp) return
+    const current = controlRef.current
+    if (current?.id === control.id) return
+    // A full manifest is authoritative. Ignore a stale descriptor page train
+    // from another carousel once it has already been accepted.
+    if (manifestRef.current && manifestRef.current.id !== control.id) return
+    decoderRef.current?.dispose()
+    controlRef.current = control
+    const nextDecoder = new FountainDecoder(control.k, control.chunk, true, 2, () => {
+      if (decoderRef.current === nextDecoder && nextDecoder.isComplete && manifestRef.current)
+        void finish()
+    })
+    decoderRef.current = nextDecoder
+    const early = pendingDataRef.current
+    pendingDataRef.current = []
+    for (const frame of early) acceptData(frame)
+    if (early.length) speedEpochRef.current++
+  }, [acceptData, finish])
+
     const onScan = useCallback((parsed: ParsedFrame | null, optical?: EncodingSpec) => {
 
     if (doneRef.current) return
@@ -493,15 +520,21 @@ export default function ReceivePage() {
         // v8 makes every repair medium-wide; v9 restores the field-proven
         // alternating graph. Keep every older mapping intact so interrupted
         // transfers remain decodable after updating this receiver.
-        decoderRef.current?.dispose()
-        const nextDecoder = new FountainDecoder(m.k, m.chunk, m.v >= 3, m.v === 8 ? 1 : m.v >= 4 ? 2 : 4, () => {
-          if (decoderRef.current === nextDecoder && nextDecoder.isComplete) void finish()
-        })
-        decoderRef.current = nextDecoder
+        const control = controlRef.current
+        const reuseFastDecoder = control?.id === m.id && control.k === m.k && control.chunk === m.chunk
+        if (!reuseFastDecoder) {
+          decoderRef.current?.dispose()
+          const nextDecoder = new FountainDecoder(m.k, m.chunk, m.v >= 3, m.v === 8 ? 1 : m.v >= 4 ? 2 : 4, () => {
+            if (decoderRef.current === nextDecoder && nextDecoder.isComplete) void finish()
+          })
+          decoderRef.current = nextDecoder
+        }
+        controlRef.current = { id: m.id, k: m.k, chunk: m.chunk, comp: m.comp }
         const early = pendingDataRef.current
         pendingDataRef.current = []
         for (const frame of early) acceptData(frame)
         if (early.length) speedEpochRef.current++
+        if (decoderRef.current?.isComplete) void finish()
       }
       return
     }
@@ -525,7 +558,7 @@ export default function ReceivePage() {
     } else {
       d.dataDropped++
     }
-  }, [acceptData])
+  }, [acceptData, finish])
 
   // Publish a display snapshot at a steady rate (keeps rendering cheap).
     useEffect(() => {
@@ -539,9 +572,11 @@ export default function ReceivePage() {
     const id = window.setInterval(() => {
       const dec = decoderRef.current
       const m = manifestRef.current
+      const control = controlRef.current
       const unique = dec?.uniqueChunks ?? 0
       const rank = dec?.innovativeRank ?? 0
-      const k = m?.k ?? 0
+      const k = m?.k ?? control?.k ?? 0
+      const chunk = m?.chunk ?? control?.chunk ?? 0
       const now = performance.now()
       if (lastSpeedEpoch !== speedEpochRef.current) {
         lastSpeedEpoch = speedEpochRef.current
@@ -550,15 +585,15 @@ export default function ReceivePage() {
         rollingSpeed = 0
       }
       const elapsed = startRef.current ? (performance.now() - startRef.current) / 1000 : 0
-      const bytes = rank * (m?.chunk ?? 0)
+      const bytes = rank * chunk
       // Rank grows when a mathematically independent equation arrives, even if
       // peeling has not released its source chunks yet. This is the true smooth
       // channel progress; decoded chunks remain visible as a secondary counter.
       const averageSpeed = elapsed > 3 ? bytes / 1024 / elapsed : 0
       const intervalSeconds = Math.max(0.001, (now - lastTs) / 1000)
-      const instantSpeed = (rank - lastRank) * (m?.chunk ?? 0) / 1024 / intervalSeconds
+      const instantSpeed = (rank - lastRank) * chunk / 1024 / intervalSeconds
       rollingSpeed = instantSpeed > 0 ? rollingSpeed * 0.55 + instantSpeed * 0.45 : rollingSpeed * 0.82
-      const rate = (averageSpeed * 1024) / Math.max(1, m?.chunk ?? 1)
+      const rate = (averageSpeed * 1024) / Math.max(1, chunk || 1)
       const eta = rate > 0 && k > 0 ? Math.max(0, (k - rank) / rate) : -1
       const scanRate = (attemptsRef.current - lastAttempts) / intervalSeconds
       lastAttempts = attemptsRef.current; lastTs = now; lastRank = rank
@@ -658,6 +693,7 @@ export default function ReceivePage() {
           onScan={onScan}
           onResolution={(w, h, fps) => { const camera = { w, h, ...(fps ? { fps } : {}) }; cameraRef.current = camera; setCamRes(camera) }}
           onStats={(s) => { statsRef.current = s }}
+          onControl={onFastControl}
           onDetect={(spec) => { detectedRef.current = spec; setDetected(spec); if (!lockTonePlayedRef.current) { lockTonePlayedRef.current = true; playChannelTone('lock', soundEnabledRef.current) } }}
           onLayoutDetect={(lanes) => { if (layoutAuto) setTileCount(lanes) }}
         />
@@ -672,13 +708,13 @@ export default function ReceivePage() {
           }}>
             {detected ? <CheckCircleOutlined /> : <CameraOutlined spin />}
             <span>{detected
-              ? `${ENC_LABEL[detected.enc]} · ${detected.gridW}×${detected.gridH}${tileCount === 2 ? ' · Turbo ×2' : ''}${camRes ? ` · ${camRes.w}×${camRes.h}` : ''}`
+              ? `${ENC_LABEL[detected.enc]} · ${detected.gridW}×${detected.gridH}${tileCount > 1 ? ` · Turbo ×${tileCount}` : ''}${camRes ? ` · ${camRes.w}×${camRes.h}` : ''}`
               : `يبحث عن المصفوفة…${camRes ? ` (${camRes.w}×${camRes.h})` : ''}`}</span>
             {diag.wasm && <Tag color="green" style={{ margin: 0, fontSize: 11 }}>WASM</Tag>}
             {diag.webGpu && <Tag color="purple" style={{ margin: 0, fontSize: 11 }}>WebGPU</Tag>}
             {!diag.webGpu && diag.webGpuStatus === 'probing' && <Tag color="geekblue" title={diag.webGpuReason} style={{ margin: 0, fontSize: 11 }}>WebGPU فحص</Tag>}
             {!diag.webGpu && (diag.webGpuStatus === 'unavailable' || diag.webGpuStatus === 'rejected') && <Tag color="orange" title={diag.webGpuReason} style={{ margin: 0, fontSize: 11 }}>CPU · WebGPU غير فعّال</Tag>}
-            {tileCount === 2 && <Tag color="blue" style={{ margin: 0, fontSize: 11 }}>L1 {diag.laneFrames[0]} · L2 {diag.laneFrames[1]}</Tag>}
+            {tileCount > 1 && <Tag color="blue" style={{ margin: 0, fontSize: 11 }}>{diag.laneFrames.slice(0, tileCount).map((count, lane) => `L${lane + 1} ${count}`).join(' · ')}</Tag>}
             {snap.rank > 0 && <Tag color="success" style={{ margin: 0, fontSize: 11 }}>نقل فعّال</Tag>}
             {detected && <Tag color={diag.phase === 'payload' ? 'cyan' : 'gold'} style={{ margin: 0, fontSize: 11 }}>
               {diag.phase === 'payload' ? 'CV Lock' : 'تتبّع مبدئي'}
@@ -737,12 +773,14 @@ export default function ReceivePage() {
               value={layoutAuto ? 'auto' : tileCount}
               onChange={value => {
                 if (value === 'auto') setLayoutAuto(true)
-                else { setLayoutAuto(false); setTileCount(value as 1 | 2) }
+                else { setLayoutAuto(false); setTileCount(value as OpticalLaneCount) }
               }}
               options={[
                 { label: 'تلقائي', value: 'auto' },
                 { label: 'مصفوفة واحدة', value: 1 },
                 { label: 'Turbo ×2', value: 2 },
+                { label: 'Turbo ×4', value: 4 },
+                { label: 'Turbo ×6', value: 6 },
               ]}
             />
           </div>
